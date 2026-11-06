@@ -1,13 +1,13 @@
 # Beads in Herdr
 
-Personal native Herdr mods for browsing project issues and opening issue-specific omp worktree sessions. Shipped Herdr layouts and mods are not modified.
+User-level native Herdr mods for browsing any project's Beads issues and opening issue-specific omp worktree sessions. This standalone source checkout lives at `~/.local/share/herdr-beads`, outside project repositories. Shipped Herdr layouts and mods are not modified.
 
 ## Install and open
 
 Requires Herdr running locally, `hc`, `bd`, `git`, `omp`, and Python 3 on PATH. Node is only needed for the model regression tests.
 
 ```sh
-bash integrations/herdr-beads/install.sh
+bash ~/.local/share/herdr-beads/install.sh
 cd /path/to/project
 go-bd --dashboard
 ```
@@ -50,7 +50,7 @@ go-bd <issue-id>               # Start/resume in the current terminal
 
 Start resolves the full issue ID, checks readiness/inherited blockers, claims atomically, and creates or reuses its issue-named omp worktree. A self-owned, unblocked `in_progress` issue can resume after its previous agent ends. Other owners' claims are not overwritten.
 
-Worktree directories, agent tabs, and worktree space names use the full bead ID, such as `surreal-go-le8.4`, without an additional repository-name prefix.
+Worktree directories, agent tabs, and worktree space names use the full bead ID, such as `myproject-123`, without an additional repository-name prefix.
 
 A live associated Herdr omp session is focused instead of duplicated. Once that terminal ends, an unblocked, self-owned `in_progress` issue with saved session metadata resumes its exact conversation in the original worktree. The dashboard offers **Go to session**, **Resume**, or **Start**, in that order. In-progress issues without saved metadata still offer Start. Each launch pins `BEADS_DIR` to the main checkout's shared database. The launcher respects the repository's omp worktree configuration; configure `worktree.clone: false` when ignored Beads databases must not be copied. Existing foreign-repository/wrong-branch worktrees are refused.
 
@@ -95,11 +95,12 @@ Per-project launch locks and terminal/dashboard receipts live under `${XDG_STATE
 ## Verification
 
 ```sh
+cd ~/.local/share/herdr-beads
 herdr-app check ~/.config/herdr-app/mods/beads-dashboard
 herdr-app check ~/.config/herdr-app/mods/bead-detail
 herdr-app check ~/.config/herdr-app/mods/beads-sidebar
-node --test integrations/herdr-beads/model.test.mjs
-python3 integrations/herdr-beads/launcher_test.py
+node --test model.test.mjs
+python3 launcher_test.py
 ```
 
 The native check only covers the initial render. Also open the dashboard in Herdr, switch between All open and Ready, check Ready against the union of `bd ready --limit 0` and `in_progress` issues, and select two issues to confirm detail-pane reuse and formatted Markdown. Check that blocked, in-progress, and deferred issues remain available in All open and closed issues do not appear as matches. For changes to session launching, also exercise a real worktree agent. Session attention states must be observed in the running app, not inferred from an issue's `in_progress` field.
