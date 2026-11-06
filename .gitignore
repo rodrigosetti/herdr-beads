@@ -1,0 +1,3 @@
+# Herdr generates editor support when checking a mod.
+mods/*/gpui-kit.d.ts
+mods/*/jsconfig.json

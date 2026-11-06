@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""Claim a Bead and run omp directly, or open its dedicated Herdr session."""
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+
+class LaunchError(Exception):
+    pass
+
+
+def command(argv, *, cwd=None, env=None, timeout=20):
+    try:
+        result = subprocess.run(
+            [str(arg) for arg in argv], cwd=cwd, env=env,
+            text=True, capture_output=True, timeout=timeout,
+        )
+    except FileNotFoundError as error:
+        raise LaunchError(f"Required command is not installed: {argv[0]}") from error
+    except subprocess.TimeoutExpired as error:
+        raise LaunchError(
+            f"{argv[0]} timed out; inspect the issue/worktree/session before retrying."
+        ) from error
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic output"
+        raise LaunchError(f"{' '.join(str(arg) for arg in argv[:3])}: {detail}")
+    return result.stdout
+
+
+def json_command(argv, **options):
+    text = command(argv, **options)
+    try:
+        value = json.loads(text)
+    except ValueError as error:
+        raise LaunchError(f"{argv[0]} returned invalid JSON: {text[:500]}") from error
+    if isinstance(value, dict) and value.get("error"):
+        raise LaunchError(f"{argv[0]}: {value['error']}")
+    return value
+
+
+def require_binary(name):
+    executable = shutil.which(name)
+    if not executable:
+        raise LaunchError(f"Required command is not installed on this machine: {name}")
+    return executable
+
+
+class Project:
+    def __init__(self):
+        # Ignore an unrelated inherited BEADS_DIR. Git's common directory selects
+        # the main checkout even when invoked from a linked worktree/subdirectory.
+        discovery_env = os.environ.copy()
+        discovery_env.pop("BEADS_DIR", None)
+        common = Path(command([
+            "git", "rev-parse", "--path-format=absolute", "--git-common-dir",
+        ]).strip()).resolve()
+        checkout = Path(command([
+            "git", "rev-parse", "--show-toplevel",
+        ]).strip()).resolve()
+        main = common.parent if common.name == ".git" else checkout
+        if (main / ".beads").is_dir():
+            discovery_env["BEADS_DIR"] = str(main / ".beads")
+        location = json_command(["bd", "where", "--json"], cwd=main, env=discovery_env)
+        if not isinstance(location, dict) or not location.get("path"):
+            raise LaunchError("bd where did not return a canonical Beads directory")
+        self.beads = Path(location["path"]).resolve()
+        self.root = main
+        self.env = discovery_env.copy()
+        self.env["BEADS_DIR"] = str(self.beads)
+        self.common = Path(command([
+            "git", "rev-parse", "--path-format=absolute", "--git-common-dir",
+        ], cwd=self.root).strip()).resolve()
+        state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+        digest = hashlib.sha256(str(self.beads).encode()).hexdigest()
+        self.state = state_home / "go-bd" / digest
+        self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    def bd(self, *args):
+        return json_command(["bd", *args, "--json"], cwd=self.root, env=self.env)
+
+    def show(self, issue_id, *, details=False):
+        flags = ["--include-comments", "--brief-deps"] if details else []
+        rows = self.bd("show", issue_id, *flags)
+        if not isinstance(rows, list) or len(rows) != 1 or not rows[0].get("id"):
+            raise LaunchError(f"Expected exactly one issue for {issue_id!r}")
+        return rows[0]
+
+    @contextlib.contextmanager
+    def lock(self, name):
+        # Never unlink lock files: all contenders must lock the same inode.
+        with (self.state / f"{name}.lock").open("a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise LaunchError("Another go-bd launch is in progress; retry when it finishes.") from error
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+    def load(self, name):
+        try:
+            with (self.state / f"{name}.json").open() as handle:
+                value = json.load(handle)
+        except FileNotFoundError:
+            return {}
+        except (ValueError, OSError) as error:
+            raise LaunchError(f"Cannot read go-bd session record: {error}") from error
+        if not isinstance(value, dict):
+            raise LaunchError("Invalid go-bd session record; expected a JSON object")
+        return value
+
+    def save(self, name, value):
+        descriptor, temporary = tempfile.mkstemp(prefix=".session-", dir=self.state)
+        try:
+            with os.fdopen(descriptor, "w") as handle:
+                json.dump(value, handle)
+                handle.write("\n")
+            os.replace(temporary, self.state / f"{name}.json")
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+def app(command_name, **args):
+    value = json_command(["herdr-app", "do", command_name, json.dumps(args)])
+    if not isinstance(value, dict):
+        raise LaunchError(f"Herdr {command_name} returned no command result")
+    return value
+
+
+def layout():
+    value = json_command(["herdr-app", "ls"])
+    if not isinstance(value, dict) or not isinstance(value.get("spaces"), list):
+        raise LaunchError("Herdr did not return a spaces list; open Herdr on this machine first")
+    return value["spaces"]
+
+
+def local_space(space):
+    return not space.get("machine")
+
+
+def terminal_info(address):
+    return json_command(["hc", "get", address, "--json"])
+
+
+def live_omp(info):
+    if info.get("state") != "live":
+        return False
+    foreground = info.get("foreground") or {}
+    # Recovered kept shells can retain the old agent report. The current
+    # foreground executable, not the title/report alone, identifies omp.
+    argv = foreground.get("argv") or info.get("argv") or []
+    name = Path(foreground.get("name") or (argv[0] if argv else "")).name
+    return name == "omp" or any(Path(str(arg)).name == "omp" for arg in argv[:2])
+
+
+def label_terminal(project, issue_id, address):
+    command([
+        "hc", "label", address,
+        f"beads.project={project.beads}", f"beads.issue={issue_id}", "--json",
+    ])
+
+
+def launch_result(project, issue_id, info, spaces, action):
+    address = info["address"]
+    labels = info.get("labels") or {}
+    space_id, tab_id = labels.get("herdr.space"), labels.get("herdr.tab")
+    for space in spaces:
+        if not local_space(space):
+            continue
+        for tab in space.get("tabs", []):
+            if any(terminal.get("terminal") == address for terminal in tab.get("terminals", [])):
+                space_id, tab_id = space["id"], tab["id"]
+    return {
+        "action": action, "terminal": address, "space": space_id,
+        "tab": tab_id,
+        "worktree": info.get("cwd") or (info.get("foreground") or {}).get("cwd"),
+        "issue": issue_id, "project": str(project.root),
+    }
+
+
+def existing_session(project, issue_id, record, spaces):
+    value = json_command([
+        "hc", "ls", "--json", "--label", f"beads.project={project.beads}",
+        "--label", f"beads.issue={issue_id}",
+    ])
+    rows = value.get("terminals") if isinstance(value, dict) else None
+    if not isinstance(rows, list):
+        raise LaunchError("hc ls did not return a terminals list")
+    addresses = [row["address"] for row in rows if row.get("address")]
+    # A durable receipt also covers interruption between creation and labeling.
+    pending = record.get("terminal")
+    if pending and pending not in addresses:
+        all_live = json_command(["hc", "ls", "--json"])
+        if any(row.get("address") == pending for row in all_live.get("terminals", [])):
+            addresses.append(pending)
+    for address in addresses:
+        info = terminal_info(address)
+        if not live_omp(info):
+            continue
+        labels = info.get("labels") or {}
+        if address == pending and any(
+            labels.get(key) not in (None, expected) for key, expected in (
+                ("beads.project", str(project.beads)), ("beads.issue", issue_id),
+            )
+        ):
+            raise LaunchError(f"Saved terminal {address} belongs to another Beads session")
+        label_terminal(project, issue_id, address)
+        app("agent.focus", terminal=address)
+        info = terminal_info(address)
+        if not live_omp(info):
+            raise LaunchError(f"Associated omp {address} exited while being focused")
+        return launch_result(project, issue_id, info, spaces, "focused")
+    return None
+
+
+def claim(project, issue):
+    issue_id = issue["id"]
+    if issue.get("status") == "in_progress":
+        # Ready intentionally excludes in-progress issues. Allow a same-owner
+        # resume, but still apply the parent's inherited blocker semantics.
+        if any(row.get("id") == issue_id for row in project.bd("blocked")):
+            raise LaunchError(f"Issue {issue_id} is blocked; refusing to resume")
+    elif not any(row.get("id") == issue_id for row in project.bd("ready", "--limit", "0")):
+        raise LaunchError(f"Issue {issue_id} is not ready; refusing to proceed")
+    project.bd("update", issue_id, "--claim")
+
+
+def worktree(project, issue_id):
+    destination = Path.home() / ".omp" / "wt" / issue_id
+    registry = json_command(["omp", "worktree", "list", "--json"], cwd=project.root, env=project.env)
+    if not isinstance(registry, list):
+        raise LaunchError("omp did not return a worktree list")
+    matches = [entry for entry in registry if entry.get("branch") == issue_id
+               and Path(entry.get("parentRepo", "")).resolve() == project.root
+               and Path(entry.get("path", "")).is_dir()]
+    if not destination.exists() and len(matches) == 1:
+        destination = Path(matches[0]["path"]).resolve()
+    if destination.exists():
+        common = Path(command([
+            "git", "rev-parse", "--path-format=absolute", "--git-common-dir",
+        ], cwd=destination).strip()).resolve()
+        registered = any(Path(entry["path"]).resolve() == destination.resolve() for entry in matches)
+        if common != project.common and not registered:
+            raise LaunchError(f"Existing worktree {destination} belongs to another repository")
+        branch = command(["git", "branch", "--show-current"], cwd=destination).strip()
+        if branch != issue_id:
+            raise LaunchError(f"Existing worktree {destination} is on {branch!r}, not {issue_id!r}")
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        command([
+            "omp", "worktree", "add", "-C", project.root, "-b", issue_id, destination,
+        ], cwd=project.root, env=project.env, timeout=120)
+    return destination.resolve()
+
+
+def prompt(project, issue_id):
+    issue = project.show(issue_id, details=True)
+    details = "\n".join(
+        f"{key}: {value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)}"
+        for key, value in issue.items()
+    )
+    return (
+        f"Bead {issue_id} is claimed and in progress. Start working on it.\n"
+        f"Use the shared Beads database at {project.beads} (BEADS_DIR is set).\n"
+        "Do not automatically close this issue, remove this worktree, or push.\n\n"
+        + details
+    )
+
+
+def confirm_started(address):
+    # Creating a Herdr terminal is not proof that its program started. Wait for
+    # both the real foreground omp and its OSC agent report; stale shell reports
+    # alone never qualify. A failed/slow startup remains visible for recovery.
+    deadline = time.monotonic() + 8
+    confirmed_since = None
+    while True:
+        info = terminal_info(address)
+        status = info.get("status") or {}
+        if live_omp(info) and isinstance(status, dict) and status.get("app") == "omp":
+            if confirmed_since is None:
+                confirmed_since = time.monotonic()
+            elif time.monotonic() - confirmed_since >= 2:
+                return info
+        else:
+            confirmed_since = None
+        foreground = info.get("foreground") or {}
+        name = Path(foreground.get("name") or "").name
+        if info.get("state") != "live" or (info.get("reported") and name in ("zsh", "bash", "sh", "fish", "nu")):
+            raise LaunchError(
+                f"omp did not remain running in {address} (exit {info.get('exit_code')}); "
+                f"inspect `hc read {address}`. The issue stays claimed and the worktree is preserved."
+            )
+        if time.monotonic() >= deadline:
+            raise LaunchError(
+                f"Cannot confirm omp startup in {address}; inspect `hc read {address}`. "
+                "The terminal/worktree are preserved; retry focuses it if omp is running."
+            )
+        time.sleep(0.15)
+
+
+def launch_herdr(project, issue, omp):
+    issue_id = issue["id"]
+    record_name = f"issue-{issue_id}"
+    spaces = layout()  # Fail before claiming if this machine has no Herdr window.
+    result = existing_session(project, issue_id, project.load(record_name), spaces)
+    if result:
+        return result
+    claim(project, issue)
+    destination = worktree(project, issue_id)
+    task = prompt(project, issue_id)
+    argv = ["env", f"BEADS_DIR={project.beads}", omp, task]
+    matching_space = next((space for space in spaces if local_space(space)
+                           and space.get("folder")
+                           and Path(space["folder"]).resolve() == destination), None)
+    if matching_space:
+        created = app("tab.new", space=matching_space["id"], name=issue_id,
+                      folder=str(destination), argv=argv)
+        created.setdefault("space", matching_space["id"])
+    else:
+        created = app(
+            "space.new", name=f"{project.root.name} · {issue_id}",
+            folder=str(destination), tab=issue_id, machine="", argv=argv,
+        )
+    if not all(created.get(key) for key in ("terminal", "space", "tab")):
+        raise LaunchError(f"Herdr did not return terminal/space/tab IDs: {created}")
+    address = created["terminal"]
+    try:
+        project.save(record_name, created)
+        label_terminal(project, issue_id, address)
+        info = confirm_started(address)
+    except (LaunchError, OSError) as error:
+        raise LaunchError(f"Session {address} was created but launch is not confirmed: {error}") from error
+    return {
+        "action": "started", "terminal": address, "space": created["space"],
+        "tab": created["tab"], "worktree": str(destination),
+        "issue": issue_id, "project": str(project.root),
+    }
+
+
+def dashboard(project):
+    spaces = layout()
+    record = project.load("dashboard")
+    for space in spaces:
+        if not local_space(space):
+            continue
+        if any(tab["id"] == record.get("tab") for tab in space.get("tabs", [])):
+            app("space.select", id=space["id"])
+            app("tab.select", id=record["tab"])
+            return {"action": "focused", "space": space["id"], "tab": record["tab"], "project": str(project.root)}
+    main_spaces = [space for space in spaces if local_space(space)
+                   and space.get("folder") and Path(space["folder"]).resolve() == project.root]
+    if main_spaces:
+        space_id = main_spaces[0]["id"]
+    else:
+        created = app("space.new", name=project.root.name, folder=str(project.root), tab="Shell", machine="")
+        space_id = created.get("space")
+        if not space_id:
+            raise LaunchError(f"Herdr did not return the new project space ID: {created}")
+    created = app("tab.new", name="Beads", space=space_id, mod="beads-dashboard",
+                  props={"folder": str(project.root), "machine": None})
+    if not created.get("tab"):
+        raise LaunchError(f"Herdr did not return the dashboard tab ID: {created}")
+    result = {"action": "started", "space": space_id, "tab": created["tab"], "project": str(project.root)}
+    project.save("dashboard", result)
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--herdr", metavar="ID", help="start or focus this issue's Herdr omp session")
+    mode.add_argument("--dashboard", action="store_true", help="open or reuse this project's Beads dashboard")
+    parser.add_argument("--json", action="store_true", help="emit the Herdr result as one JSON object")
+    parser.add_argument("issue", nargs="?", help="issue to claim and run directly with omp")
+    args = parser.parse_args()
+    if (args.herdr or args.dashboard) and args.issue:
+        parser.error("use either a direct issue ID, --herdr ID, or --dashboard")
+    if not (args.herdr or args.dashboard or args.issue):
+        parser.error("an issue ID or --dashboard is required")
+    if args.json and args.issue:
+        parser.error("--json requires --herdr ID or --dashboard")
+    require_binary("git")
+    require_binary("bd")
+    if args.herdr or args.dashboard:
+        require_binary("herdr-app")
+        require_binary("hc")
+    omp = require_binary("omp") if not args.dashboard else None
+    project = Project()
+    if args.dashboard:
+        with project.lock("dashboard"):
+            result = dashboard(project)
+    else:
+        issue = project.show(args.herdr or args.issue)
+        issue_id = issue["id"]
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", issue_id):
+            raise LaunchError(f"Issue ID cannot safely name a worktree: {issue_id!r}")
+        with project.lock(f"issue-{issue_id}"):
+            issue = project.show(issue_id)
+            if args.herdr:
+                result = launch_herdr(project, issue, omp)
+            else:
+                claim(project, issue)
+                destination = worktree(project, issue_id)
+                task = prompt(project, issue_id)
+        if not args.herdr:
+            os.chdir(destination)
+            os.execve(omp, [omp, task], project.env)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        print(f"{result['action'].capitalize()} {result.get('issue', 'Beads dashboard')} "
+              f"in Herdr ({result['space']} / {result['tab']})")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (LaunchError, OSError) as error:
+        print(f"go-bd: {error}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("go-bd: interrupted; any claimed issue, worktree, and terminal are preserved", file=sys.stderr)
+        sys.exit(130)
