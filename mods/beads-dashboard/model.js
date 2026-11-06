@@ -1,12 +1,11 @@
 const priority = (issue) => Number.isFinite(issue.priority) ? issue.priority : 5;
 const compare = (a, b) => priority(a) - priority(b) || a.id.localeCompare(b.id);
 
-export function issueRows(issues, blocked, { hideBlocked = false, query = "", folded = new Set() } = {}) {
+export function issueRows(issues, ready, { mode = "all", folded = new Set() } = {}) {
   const byId = new Map(issues.map((issue) => [issue.id, issue]));
-  const search = query.trim().toLowerCase();
-  const matches = issues.filter((issue) => !issue.context && issue.status !== "closed"
-    && (!hideBlocked || (!blocked.has(issue.id) && issue.status !== "blocked"))
-    && (!search || [issue.id, issue.title, issue.issue_type, ...(issue.labels ?? [])].join(" ").toLowerCase().includes(search)));
+  const open = issues.filter((issue) => !issue.context && issue.status !== "closed");
+  const readyIssues = open.filter((issue) => ready.has(issue.id));
+  const matches = mode === "ready" ? readyIssues : open;
   const matched = new Set(matches.map((issue) => issue.id));
   const included = new Set(matched);
   for (const issue of matches) {
@@ -47,7 +46,7 @@ export function issueRows(issues, blocked, { hideBlocked = false, query = "", fo
   for (const root of roots) visit(root, 0);
   // A malformed parent cycle must not make otherwise visible issues disappear.
   for (const issue of [...included].map((id) => byId.get(id)).sort(compare)) visit(issue, 0);
-  return { rows, count: matches.length };
+  return { rows, count: matches.length, counts: { all: open.length, ready: readyIssues.length } };
 }
 
 const shells = new Set(["sh", "bash", "zsh", "fish", "nu", "dash", "ksh", "pwsh", "powershell", "cmd"]);
