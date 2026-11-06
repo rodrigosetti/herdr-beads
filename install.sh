@@ -12,6 +12,7 @@ for mod in beads-dashboard bead-detail beads-sidebar; do
 done
 mkdir -p "$bin_home"
 cp -f "$source_dir/bin/go-bd" "$bin_home/go-bd"
+cp -f "$source_dir/bin/go-bd-session.mjs" "$bin_home/go-bd-session.mjs"
 chmod +x "$bin_home/go-bd"
 mkdir -p "$app_home/layouts"
 if [[ ! -e "$app_home/layouts/beads-workspace.json" ]]; then

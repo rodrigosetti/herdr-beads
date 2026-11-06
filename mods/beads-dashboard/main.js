@@ -1,7 +1,7 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { agents, exec, focused, nextCommand, panes, props, run, setShared, spaces, terminals, theme } from "herdr";
-import { issueRows, issueSessions, sessionLabels, statusLabels } from "./model.js";
+import { issueAction, issueRows, issueSessions, sessionLabels, statusLabels } from "./model.js";
 
 function preferences(key) {
   try { return JSON.parse(localStorage.getItem(key) ?? "{}"); } catch { return {}; }
@@ -143,7 +143,7 @@ export default class BeadsDashboard extends View {
     if (!issue || !this.project || this.starting.has(id)) return;
     const existing = this.sessionMap().get(id);
     if (existing?.length) { this.focusSession(existing[0]); return; }
-    if (this.blocked.has(id) || !["open", "in_progress"].includes(issue.status)) {
+    if (!issueAction(issue, { blocked: this.blocked.has(id) })) {
       this.error = `${id} is not available to start. Resolve its blockers or deferred status first.`;
       cx.notify();
       return;
@@ -156,7 +156,8 @@ export default class BeadsDashboard extends View {
       try {
         const result = checked(await exec("go-bd", ["--herdr", id, "--json"], { cwd: this.project.folder, on: this.machine }), "go-bd");
         if (result.error) throw new Error(result.error);
-        this.notice = `${result.action === "focused" ? "Opened existing session" : "Started session"} for ${id}`;
+        const notice = result.action === "focused" ? "Opened existing session" : result.action === "resumed" ? "Resumed session" : "Started session";
+        this.notice = `${notice} for ${id}`;
         this.refresh(cx);
       } catch (error) { this.error = String(error.message ?? error); }
       finally { this.starting.delete(id); cx.notify(); }
@@ -174,7 +175,7 @@ export default class BeadsDashboard extends View {
     const { issue, depth, context, children, folded } = row;
     const live = sessions.get(issue.id) ?? [], session = live[0];
     const blocked = this.blocked.has(issue.id), ready = this.ready.has(issue.id), busy = this.starting.has(issue.id);
-    const canStart = !context && !blocked && ["open", "in_progress"].includes(issue.status);
+    const decision = issueAction(issue, { session, blocked, context });
     const priorityColor = [t.blocked, t.ansi3, t.ansi6, t.muted, t.dim][issue.priority] ?? t.dim;
     const fold = div().id(`fold-${issue.id}`).w(16).flex_none().text_color(t.dim)
       .when(children > 0, (element) => element.cursor_pointer().on_click((_event, cx) => {
@@ -191,9 +192,9 @@ export default class BeadsDashboard extends View {
         .child(ready ? "Ready" : statusLabels[issue.status] ?? issue.status))
       .when(blocked, (element) => element.child(div().text_color(t.blocked).child("Dependency blocked")))
       .when(context, (element) => element.child(div().child("Group context")));
-    const action = session ? this.button(`go-${issue.id}`, "Go to session", () => this.focusSession(session), t)
-      : busy ? div().flex_none().text_size(12).text_color(t.muted).frames(["Starting", "Starting ·", "Starting ··"], 300)
-      : canStart ? this.button(`start-${issue.id}`, "Start", (cx) => this.launch(issue.id, cx), t)
+    const action = decision === "focus" ? this.button(`go-${issue.id}`, "Go to session", () => this.focusSession(session), t)
+      : busy ? div().flex_none().text_size(12).text_color(t.muted).frames(decision === "resume" ? ["Resuming", "Resuming ·", "Resuming ··"] : ["Starting", "Starting ·", "Starting ··"], 300)
+      : decision ? this.button(`start-${issue.id}`, decision === "resume" ? "Resume" : "Start", (cx) => this.launch(issue.id, cx), t)
       : div().flex_none().w(58);
     return h_flex().id(`bead-${issue.id}`).flex_none().min_h(68).pl(10 + Math.min(depth, 8) * 18).pr(12).py(10).gap(8).items_center()
       .border_b(1).border_color(t.border).cursor_pointer().bg(this.selected === issue.id ? t.selected : issue.issue_type === "epic" ? t.surface : t.background)

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { issueRows, issueSessions } from "./mods/beads-dashboard/model.js";
+import { issueAction, issueRows, issueSessions } from "./mods/beads-dashboard/model.js";
 
 const issue = (id, priority, parent, extra = {}) => ({ id, title: id, priority, parent, status: "open", issue_type: parent ? "task" : "epic", ...extra });
 
@@ -128,4 +128,46 @@ test("multiple live sessions preserve attention precedence and exclude finished 
   terminals.push({ ...terminals[0], address: "ended", state: "finished" });
   const sessions = issueSessions("/p/.beads", null, terminals, statuses.map((status) => ({ address: status, status })));
   assert.deepEqual(sessions.get("p-1").map(({ status }) => status), ["blocked", "done", "working", "idle"]);
+});
+
+test("live sessions take precedence over saved sessions and launch restrictions", () => {
+  const saved = { omp_session: { session_id: "actual-id", session_file: "/sessions/actual.jsonl", machine: "local", worktree: "/worktree" } };
+  for (const status of ["open", "in_progress", "blocked", "deferred", "closed"]) {
+    const item = issue("work", 1, null, { status, metadata: saved });
+    assert.equal(issueAction(item, { session: { address: "t1" }, blocked: true, context: true }), "focus");
+  }
+});
+
+test("only unblocked noncontext in-progress issues with a saved key offer Resume", () => {
+  const saved = { omp_session: { session_id: "actual-id", session_file: "/sessions/actual.jsonl", machine: "local", worktree: "/worktree" } };
+  const working = issue("work", 1, null, { status: "in_progress", metadata: saved });
+  assert.equal(issueAction(working), "resume");
+  assert.equal(issueAction(working, { blocked: true }), null);
+  assert.equal(issueAction(working, { context: true }), null);
+  assert.equal(issueAction({ ...working, context: true }), null);
+  for (const status of ["blocked", "deferred", "closed"]) {
+    assert.equal(issueAction({ ...working, status }), null);
+  }
+  assert.equal(issueAction({ ...working, status: "open" }), "start");
+  for (const metadata of [undefined, null, {}, { unrelated: "preserved" }]) {
+    assert.equal(issueAction({ ...working, metadata }), "start");
+  }
+});
+
+test("malformed saved records still offer Resume so the launcher can report their errors", () => {
+  for (const omp_session of [null, false, 0, "", "old-id", [], {}, { session_id: "incomplete" }]) {
+    const working = issue("work", 1, null, { status: "in_progress", metadata: { unrelated: "preserved", omp_session } });
+    assert.equal(issueAction(working), "resume");
+  }
+});
+
+test("finished and recovered terminals fall back to the persistent session rather than focus", () => {
+  const working = issue("work", 1, null, { status: "in_progress", metadata: { omp_session: { session_id: "saved" } } });
+  const terminal = { address: "t1", state: "live", foreground: { name: "omp" }, labels: { "beads.project": "/p/.beads", "beads.issue": working.id } };
+  for (const change of [{ state: "finished" }, { foreground: { name: "zsh" } }]) {
+    const sessions = issueSessions("/p/.beads", null, [{ ...terminal, ...change }], [{ address: "t1", status: "working" }]);
+    assert.equal(issueAction(working, { session: sessions.get(working.id)?.[0] }), "resume");
+  }
+  const sessions = issueSessions("/p/.beads", null, [terminal], [{ address: "t1", status: "working" }]);
+  assert.equal(issueAction(working, { session: sessions.get(working.id)?.[0] }), "focus");
 });

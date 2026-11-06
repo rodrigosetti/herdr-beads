@@ -13,6 +13,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import signal
+import uuid
 import time
 
 
@@ -238,15 +240,146 @@ def claim(project, issue):
     project.bd("update", issue_id, "--claim")
 
 
-def worktree(project, issue_id):
-    destination = Path.home() / ".omp" / "wt" / issue_id
+def machine_id():
+    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    directory = state_home / "go-bd"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    identity = directory / "machine-id"
+    descriptor, temporary = tempfile.mkstemp(prefix=".machine-", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(str(uuid.uuid4()) + "\n")
+        try:
+            os.link(temporary, identity)
+        except FileExistsError:
+            pass
+    finally:
+        os.unlink(temporary)
+    value = identity.read_text().strip()
+    if not value:
+        raise LaunchError(f"Machine identifier is empty: {identity}")
+    return value
+
+
+def session_header(path):
+    try:
+        with path.open() as handle:
+            prefix = handle.read(65536)
+        for line in prefix.splitlines()[:3]:
+            entry = json.loads(line)
+            if isinstance(entry, dict) and entry.get("type") == "session":
+                return entry
+    except (OSError, ValueError) as error:
+        raise LaunchError(f"Cannot read saved omp transcript {path}: {error}") from error
+    raise LaunchError(f"Saved omp transcript has no session header: {path}")
+
+
+def saved_session(issue, machine):
+    metadata = issue.get("metadata") or {}
+    if not isinstance(metadata, dict) or "omp_session" not in metadata:
+        return None
+    if issue.get("status") != "in_progress":
+        raise LaunchError("This issue has recorded omp history but is not in_progress; "
+                          "refusing to replace or resume that history automatically.")
+    record = metadata["omp_session"]
+    fields = ("session_id", "session_file", "machine", "worktree")
+    if not isinstance(record, dict) or any(not isinstance(record.get(key), str)
+                                          or not record[key] for key in fields):
+        raise LaunchError("Invalid metadata.omp_session; the saved record is preserved")
+    if record["machine"] != machine:
+        raise LaunchError("Saved omp session belongs to another machine; the saved record is preserved")
+    transcript, destination = Path(record["session_file"]), Path(record["worktree"])
+    if not transcript.is_absolute() or not destination.is_absolute():
+        raise LaunchError("Saved omp transcript and worktree paths must be absolute")
+    if not transcript.is_file():
+        raise LaunchError(f"Saved omp transcript is missing: {transcript}; refusing a fresh session")
+    if not destination.is_dir():
+        raise LaunchError(f"Saved omp worktree is missing: {destination}; refusing to recreate it")
+    header = session_header(transcript)
+    if header.get("id") != record["session_id"]:
+        raise LaunchError("Saved transcript ID differs from metadata.omp_session.session_id")
+    if not isinstance(header.get("cwd"), str) or Path(header["cwd"]).resolve() != destination.resolve():
+        raise LaunchError("Saved transcript belongs to a different working directory")
+    return record
+
+
+def session_arguments(omp, extension, previous):
+    argv = [omp, "--extension", str(extension)]
+    if previous:
+        argv.extend(["--resume", previous["session_file"]])
+    return argv
+
+
+def prepare_session(project, issue, omp):
+    machine = machine_id()
+    previous = saved_session(issue, machine)
+    extension = Path(__file__).resolve().with_name("go-bd-session.mjs")
+    if not extension.is_file():
+        raise LaunchError(f"Required omp session extension is missing: {extension}; reinstall go-bd")
+    claim(project, issue)
+    # Validate the original registered worktree; never regenerate an alternate
+    # default path when resuming recorded history.
+    destination = worktree(project, issue["id"], recorded=previous["worktree"] if previous else None)
+    name = f"launch-{uuid.uuid4()}"
+    ack = project.state / f"{name}-ack.json"
+    config = {
+        "issue": issue["id"], "root": str(project.root), "beads": str(project.beads),
+        "worktree": str(destination), "machine": machine, "previous": previous,
+        "bd": require_binary("bd"), "ack": str(ack),
+    }
+    if not previous:
+        descriptor, task_file = tempfile.mkstemp(prefix=f"{name}-prompt-", dir=project.state)
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(prompt(project, issue["id"]))
+        config["prompt_file"] = task_file
+    project.save(name, config)
+    config_path = project.state / f"{name}.json"
+    env = project.env.copy()
+    env["GO_BD_SESSION_CONFIG"] = str(config_path)
+    argv = session_arguments(omp, extension, previous)
+    return destination, argv, env, ack, "resumed" if previous else "started"
+
+
+def startup_receipt(ack):
+    try:
+        value = json.loads(ack.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as error:
+        raise LaunchError(f"Cannot read omp startup acknowledgement: {error}") from error
+    if not isinstance(value, dict):
+        raise LaunchError("Invalid omp startup acknowledgement")
+    if value.get("error"):
+        raise LaunchError(value["error"])
+    session = value.get("session")
+    if not isinstance(session, dict) or not session.get("session_id"):
+        raise LaunchError("omp did not acknowledge a persistent session")
+    return session
+
+
+def confirm_direct(process, ack):
+    deadline = time.monotonic() + 45
+    while True:
+        receipt = startup_receipt(ack)
+        if receipt:
+            return receipt
+        if process.poll() is not None:
+            raise LaunchError(f"omp exited before saving its session (exit {process.returncode})")
+        if time.monotonic() >= deadline:
+            process.terminate()
+            raise LaunchError("omp did not acknowledge persistent session startup; launch failed")
+        time.sleep(0.15)
+
+
+def worktree(project, issue_id, *, recorded=None):
+    destination = Path(recorded) if recorded else Path.home() / ".omp" / "wt" / issue_id
     registry = json_command(["omp", "worktree", "list", "--json"], cwd=project.root, env=project.env)
     if not isinstance(registry, list):
         raise LaunchError("omp did not return a worktree list")
     matches = [entry for entry in registry if entry.get("branch") == issue_id
                and Path(entry.get("parentRepo", "")).resolve() == project.root
                and Path(entry.get("path", "")).is_dir()]
-    if not destination.exists() and len(matches) == 1:
+    if not recorded and not destination.exists() and len(matches) == 1:
         destination = Path(matches[0]["path"]).resolve()
     if destination.exists():
         common = Path(command([
@@ -259,6 +392,8 @@ def worktree(project, issue_id):
         if branch != issue_id:
             raise LaunchError(f"Existing worktree {destination} is on {branch!r}, not {issue_id!r}")
     else:
+        if recorded:
+            raise LaunchError(f"Saved omp worktree is missing: {destination}; refusing to recreate it")
         destination.parent.mkdir(parents=True, exist_ok=True)
         command([
             "omp", "worktree", "add", "-C", project.root, "-b", issue_id, destination,
@@ -280,25 +415,28 @@ def prompt(project, issue_id):
     )
 
 
-def confirm_started(address):
-    # Creating a Herdr terminal is not proof that its program started. Wait for
-    # both the real foreground omp and its OSC agent report; stale shell reports
-    # alone never qualify. A failed/slow startup remains visible for recovery.
-    deadline = time.monotonic() + 8
+def confirm_started(address, ack):
+    # Both native foreground detection and the lifecycle persistence receipt
+    # must succeed. A terminal or OSC agent report alone is not a launch.
+    deadline = time.monotonic() + 45
     confirmed_since = None
+    seen_omp = False
     while True:
         info = terminal_info(address)
+        receipt = startup_receipt(ack)
+        if live_omp(info):
+            seen_omp = True
         status = info.get("status") or {}
-        if live_omp(info) and isinstance(status, dict) and status.get("app") == "omp":
+        if receipt and live_omp(info) and isinstance(status, dict) and status.get("app") == "omp":
             if confirmed_since is None:
                 confirmed_since = time.monotonic()
             elif time.monotonic() - confirmed_since >= 2:
-                return info
+                return info, receipt
         else:
             confirmed_since = None
         foreground = info.get("foreground") or {}
         name = Path(foreground.get("name") or "").name
-        if info.get("state") != "live" or (info.get("reported") and name in ("zsh", "bash", "sh", "fish", "nu")):
+        if info.get("state") != "live" or (seen_omp and name in ("zsh", "bash", "sh", "fish", "nu")):
             raise LaunchError(
                 f"omp did not remain running in {address} (exit {info.get('exit_code')}); "
                 f"inspect `hc read {address}`. The issue stays claimed and the worktree is preserved."
@@ -318,10 +456,9 @@ def launch_herdr(project, issue, omp):
     result = existing_session(project, issue_id, project.load(record_name), spaces)
     if result:
         return result
-    claim(project, issue)
-    destination = worktree(project, issue_id)
-    task = prompt(project, issue_id)
-    argv = ["env", f"BEADS_DIR={project.beads}", omp, task]
+    destination, omp_argv, env, ack, action = prepare_session(project, issue, omp)
+    argv = ["env", f"BEADS_DIR={project.beads}",
+            f"GO_BD_SESSION_CONFIG={env['GO_BD_SESSION_CONFIG']}", *omp_argv]
     matching_space = next((space for space in spaces if local_space(space)
                            and space.get("folder")
                            and Path(space["folder"]).resolve() == destination), None)
@@ -340,11 +477,12 @@ def launch_herdr(project, issue, omp):
     try:
         project.save(record_name, created)
         label_terminal(project, issue_id, address)
-        info = confirm_started(address)
+        info, receipt = confirm_started(address, ack)
     except (LaunchError, OSError) as error:
         raise LaunchError(f"Session {address} was created but launch is not confirmed: {error}") from error
     return {
-        "action": "started", "terminal": address, "space": created["space"],
+        "action": action, "session_id": receipt["session_id"],
+        "terminal": address, "space": created["space"],
         "tab": created["tab"], "worktree": str(destination),
         "issue": issue_id, "project": str(project.root),
     }
@@ -412,12 +550,20 @@ def main():
             if args.herdr:
                 result = launch_herdr(project, issue, omp)
             else:
-                claim(project, issue)
-                destination = worktree(project, issue_id)
-                task = prompt(project, issue_id)
+                record = project.load(f"issue-{issue_id}")
+                if record.get("terminal") and shutil.which("hc") and shutil.which("herdr-app"):
+                    result = existing_session(project, issue_id, record, [])
+                    if result:
+                        print(f"Focused {issue_id} in Herdr ({result['space']} / {result['tab']})")
+                        return
+                destination, argv, env, ack, action = prepare_session(project, issue, omp)
+                # Keep the launch lock through acknowledgement; concurrent
+                # launches cannot race the first metadata write.
+                signal.signal(signal.SIGINT, lambda _signum, _frame: None)
+                process = subprocess.Popen(argv, cwd=destination, env=env)
+                confirm_direct(process, ack)
         if not args.herdr:
-            os.chdir(destination)
-            os.execve(omp, [omp, task], project.env)
+            sys.exit(process.wait())
     if args.json:
         print(json.dumps(result, ensure_ascii=False))
     else:

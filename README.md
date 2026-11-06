@@ -12,7 +12,7 @@ cd /path/to/project
 go-bd --dashboard
 ```
 
-The installer copies `beads-dashboard`, `bead-detail`, and `beads-sidebar` into `${HERDR_APP_HOME:-~/.config/herdr-app}/mods`, installs the personal `beads-workspace` layout, and updates `~/.local/bin/go-bd`. An existing personal layout file is preserved on reinstall. Keep `~/.local/bin` on PATH. `HERDR_APP_HOME` selects a different Herdr window/configuration.
+The installer copies `beads-dashboard`, `bead-detail`, and `beads-sidebar` into `${HERDR_APP_HOME:-~/.config/herdr-app}/mods`, installs the personal `beads-workspace` layout, and updates `~/.local/bin/go-bd` together with its `go-bd-session.mjs` startup extension. Keep these two launcher files together. An existing personal layout file is preserved on reinstall. Keep `~/.local/bin` on PATH. `HERDR_APP_HOME` selects a different Herdr window/configuration.
 
 `go-bd --dashboard` opens or focuses the project's Beads tab in its main-checkout space. The dashboard stays pinned to that project when another pane changes directory. Invoking the command from a linked worktree or nested folder resolves the same main checkout and database.
 
@@ -44,21 +44,37 @@ The mod uses Herdr's `exec` API to run the Beads CLI. It does not read exports, 
 ## Start and return to work
 
 ```sh
-go-bd --herdr <issue-id>       # Same operation as Start in the dashboard
-go-bd <issue-id>               # Original direct terminal workflow
+go-bd --herdr <issue-id>       # Start, resume saved conversation, or focus live session
+go-bd <issue-id>               # Start/resume in the current terminal
 ```
 
 Start resolves the full issue ID, checks readiness/inherited blockers, claims atomically, and creates or reuses its issue-named omp worktree. A self-owned, unblocked `in_progress` issue can resume after its previous agent ends. Other owners' claims are not overwritten.
 
 Worktree directories, agent tabs, and worktree space names use the full bead ID, such as `surreal-go-le8.4`, without an additional repository-name prefix.
 
-A live associated omp session is focused instead of duplicated. If only its old shell remains, a new agent tab is opened in the existing worktree space. Each launch pins `BEADS_DIR` to the main checkout's shared database. The launcher respects the repository's omp worktree configuration; configure `worktree.clone: false` when ignored Beads databases must not be copied. Existing foreign-repository/wrong-branch worktrees are refused.
+A live associated Herdr omp session is focused instead of duplicated. Once that terminal ends, an unblocked, self-owned `in_progress` issue with saved session metadata resumes its exact conversation in the original worktree. The dashboard offers **Go to session**, **Resume**, or **Start**, in that order. In-progress issues without saved metadata still offer Start. Each launch pins `BEADS_DIR` to the main checkout's shared database. The launcher respects the repository's omp worktree configuration; configure `worktree.clone: false` when ignored Beads databases must not be copied. Existing foreign-repository/wrong-branch worktrees are refused.
 
 The launcher labels the core terminal with `beads.project=<canonical .beads path>` and `beads.issue=<full issue ID>`. This explicit association survives app restarts. Sessions started before installation are not guessed from titles. To associate a known existing session manually:
 
 ```sh
 hc label <terminal-address> beads.project=/absolute/project/.beads beads.issue=<full-issue-id>
 ```
+
+### Persistent conversations
+
+Both direct and Herdr launches load the explicit startup extension. It obtains the actual persistent session ID and transcript path from omp's lifecycle API, makes the transcript durable, and saves an object in the bead's `metadata.omp_session` with:
+
+- `session_id`: the exact omp session ID, not a guessed newest session or ID prefix.
+- `session_file`: the absolute saved transcript path.
+- `machine`: a local identity stored in `${XDG_STATE_HOME:-~/.local/state}/go-bd/machine-id`.
+- `worktree`: the original absolute worktree directory.
+
+The metadata update merges only this key and preserves other metadata. A fresh task is delivered only after the transcript and metadata are saved; Herdr success also requires the startup acknowledgement. Primary-session switches/forks update the association; subagent sessions do not replace it.
+
+Resume uses `omp --resume <session_file>` with no new startup task and no `--restore`: it reopens the conversation and waits for input rather than automatically restarting interrupted work. The original transcript ID, machine, directory, repository, and worktree branch are checked. Missing transcripts/worktrees, malformed records, foreign-machine records, or conflicting session ownership fail explicitly rather than starting fresh. Recorded history on a non-`in_progress` issue is not automatically replaced or resumed.
+
+The ID is a pointer, not a backup. Keep the transcript and local machine identity; moving to another machine requires deliberate session transfer and association updates. Sessions started before this integration was installed are not retroactively discovered or guessed. The extension lifecycle/storage APIs were exercised with omp 18.17.0.
+
 
 The dashboard counts actual live agents, not kept shells or finished terminals. Multiple associated sessions remain visible as a count, with the most urgent attention state first. Go to session and the status badge focus that agent.
 
@@ -83,6 +99,10 @@ herdr-app check ~/.config/herdr-app/mods/beads-dashboard
 herdr-app check ~/.config/herdr-app/mods/bead-detail
 herdr-app check ~/.config/herdr-app/mods/beads-sidebar
 node --test integrations/herdr-beads/model.test.mjs
+python3 integrations/herdr-beads/launcher_test.py
 ```
 
 The native check only covers the initial render. Also open the dashboard in Herdr, switch between All open and Ready, check Ready against the union of `bd ready --limit 0` and `in_progress` issues, and select two issues to confirm detail-pane reuse and formatted Markdown. Check that blocked, in-progress, and deferred issues remain available in All open and closed issues do not appear as matches. For changes to session launching, also exercise a real worktree agent. Session attention states must be observed in the running app, not inferred from an issue's `in_progress` field.
+
+For persistence changes, use an isolated project to start a real session, remember a unique token, terminate the terminal, and resume. Verify the same session ID and worktree, token recall without resending it, preservation of unrelated metadata, live-session focus without duplication, and visible errors for missing transcripts or a different machine. Exercise both direct and Herdr launches and observe the dashboard's Start → Go to session → Resume transitions.
+

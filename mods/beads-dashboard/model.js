@@ -49,6 +49,14 @@ export function issueRows(issues, ready, { mode = "all", folded = new Set() } = 
   return { rows, count: matches.length, counts: { all: open.length, ready: readyIssues.length } };
 }
 
+export function issueAction(issue, { session, blocked = false, context = issue.context } = {}) {
+  if (session) return "focus";
+  if (context || blocked || !["open", "in_progress"].includes(issue.status)) return null;
+  // Presence, not validity: the launcher must report malformed saved sessions.
+  if (issue.status === "in_progress" && Object.prototype.hasOwnProperty.call(issue.metadata ?? {}, "omp_session")) return "resume";
+  return "start";
+}
+
 const shells = new Set(["sh", "bash", "zsh", "fish", "nu", "dash", "ksh", "pwsh", "powershell", "cmd"]);
 const urgency = { blocked: 0, done: 1, working: 2, idle: 3, starting: 4 };
 
