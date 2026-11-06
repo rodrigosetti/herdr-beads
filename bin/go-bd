@@ -331,7 +331,7 @@ def launch_herdr(project, issue, omp):
         created.setdefault("space", matching_space["id"])
     else:
         created = app(
-            "space.new", name=f"{project.root.name} · {issue_id}",
+            "space.new", name=issue_id,
             folder=str(destination), tab=issue_id, machine="", argv=argv,
         )
     if not all(created.get(key) for key in ("terminal", "space", "tab")):

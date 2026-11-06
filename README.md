@@ -50,6 +50,8 @@ go-bd <issue-id>               # Original direct terminal workflow
 
 Start resolves the full issue ID, checks readiness/inherited blockers, claims atomically, and creates or reuses its issue-named omp worktree. A self-owned, unblocked `in_progress` issue can resume after its previous agent ends. Other owners' claims are not overwritten.
 
+Worktree directories, agent tabs, and worktree space names use the full bead ID, such as `surreal-go-le8.4`, without an additional repository-name prefix.
+
 A live associated omp session is focused instead of duplicated. If only its old shell remains, a new agent tab is opened in the existing worktree space. Each launch pins `BEADS_DIR` to the main checkout's shared database. The launcher respects the repository's omp worktree configuration; configure `worktree.clone: false` when ignored Beads databases must not be copied. Existing foreign-repository/wrong-branch worktrees are refused.
 
 The launcher labels the core terminal with `beads.project=<canonical .beads path>` and `beads.issue=<full issue ID>`. This explicit association survives app restarts. Sessions started before installation are not guessed from titles. To associate a known existing session manually:
