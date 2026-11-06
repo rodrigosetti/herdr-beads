@@ -4,7 +4,7 @@ const compare = (a, b) => priority(a) - priority(b) || a.id.localeCompare(b.id);
 export function issueRows(issues, ready, { mode = "all", folded = new Set() } = {}) {
   const byId = new Map(issues.map((issue) => [issue.id, issue]));
   const open = issues.filter((issue) => !issue.context && issue.status !== "closed");
-  const readyIssues = open.filter((issue) => ready.has(issue.id));
+  const readyIssues = open.filter((issue) => ready.has(issue.id) || issue.status === "in_progress");
   const matches = mode === "ready" ? readyIssues : open;
   const matched = new Set(matches.map((issue) => issue.id));
   const included = new Set(matched);

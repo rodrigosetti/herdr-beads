@@ -228,7 +228,7 @@ export default class BeadsDashboard extends View {
       .when(!!this.notice, (element) => element.child(div().flex_none().px(16).py(8).text_size(12).text_color(t.done).child(this.notice)))
       .child(v_flex().id("beads-list").flex_1().min_h(0).overflow_y_scrollbar().children(rows.map((row) => this.row(row, sessions, t)))
         .when(!rows.length, (element) => element.child(v_flex().p(24).gap(8)
-          .child(div().text_color(t.muted).child(!this.loaded ? this.loading ? "Loading beads…" : "Could not load this project." : this.mode === "ready" ? "No issues are ready to start." : "No open issues.")))))
+          .child(div().text_color(t.muted).child(!this.loaded ? this.loading ? "Loading beads…" : "Could not load this project." : this.mode === "ready" ? "No ready or in-progress issues." : "No open issues.")))))
       .child(h_flex().flex_none().px(16).py(8).gap(12).border_t(1).border_color(t.border).text_size(10.5).text_color(t.dim)
         .child(div().flex_1().child("Session status ≠ issue status · Done is an unseen finished turn"))
         .when(!!this.updated, (element) => element.child(div().child(`Updated ${this.updated}`))));

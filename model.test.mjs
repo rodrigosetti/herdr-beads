@@ -9,7 +9,7 @@ test("actual parents determine nesting and siblings sort by priority", () => {
   assert.deepEqual(issueRows(data, new Set()).rows.map(({ issue, depth }) => [issue.id, depth]), [["milestone", 0], ["urgent", 1], ["unrelated-id", 1]]);
 });
 
-test("ready membership comes from the authoritative IDs, not merely an unblocked status", () => {
+test("Ready includes authoritative ready IDs and in-progress work, but not merely unblocked issues", () => {
   const data = [
     issue("ready", 0),
     issue("also-ready", 1),
@@ -20,10 +20,12 @@ test("ready membership comes from the authoritative IDs, not merely an unblocked
     issue("blocked", 3, null, { status: "blocked" }),
     issue("inherited-blocker", 3),
   ];
-  const result = issueRows(data, new Set(["ready", "also-ready"]), { mode: "ready" });
-  assert.deepEqual(result.rows.map(({ issue }) => issue.id), ["ready", "also-ready"]);
-  assert.equal(result.count, 2);
-  assert.deepEqual(result.counts, { all: 8, ready: 2 });
+  for (const ready of [new Set(["ready", "also-ready"]), new Set(["ready", "also-ready", "working"])]) {
+    const result = issueRows(data, ready, { mode: "ready" });
+    assert.deepEqual(result.rows.map(({ issue }) => issue.id), ["ready", "also-ready", "working"]);
+    assert.equal(result.count, 3);
+    assert.deepEqual(result.counts, { all: 8, ready: 3 });
+  }
 });
 
 test("all open is the default and includes every nonclosed status regardless of readiness", () => {
@@ -41,7 +43,7 @@ test("all open is the default and includes every nonclosed status regardless of 
     const result = issueRows(data, ready, options);
     assert.deepEqual(result.rows.map(({ issue }) => issue.id), expected);
     assert.equal(result.count, 5);
-    assert.deepEqual(result.counts, { all: 5, ready: 1 });
+    assert.deepEqual(result.counts, { all: 5, ready: 2 });
   }
 });
 
@@ -54,11 +56,11 @@ test("ready descendants keep their actual ancestors as uncounted context", () =>
     issue("closed-unrelated", 0, null, { status: "closed" }),
   ];
   const result = issueRows(data, new Set(["ready-child"]), { mode: "ready" });
-  assert.equal(result.count, 1);
-  assert.deepEqual(result.counts, { all: 3, ready: 1 });
+  assert.equal(result.count, 2);
+  assert.deepEqual(result.counts, { all: 3, ready: 2 });
   assert.deepEqual(result.rows.map(({ issue, depth, context }) => [issue.id, depth, context]), [
     ["closed-parent", 0, true],
-    ["unrelated-prefix", 1, true],
+    ["unrelated-prefix", 1, false],
     ["ready-child", 2, false],
   ]);
 });
