@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="360" height="220" viewBox="0 0 360 220">
+  <rect x="1" y="1" width="358" height="218" rx="8" fill="#16181c" stroke="#52565e"/>
+  <path d="M91 1v218M91 30h268M1 170h90" fill="none" stroke="#353941"/>
+  <g fill="#b6bbc5" font-family="sans-serif" font-size="9">
+    <text x="14" y="22">Herdr</text><text x="12" y="48">Spaces</text>
+    <text x="16" y="67">Project</text><text x="23" y="84">Worktree</text>
+    <text x="12" y="112">Agents</text><text x="16" y="130">Working</text>
+    <text x="16" y="205">Settings</text><text x="108" y="20">Beads</text>
+  </g>
+  <rect x="8" y="176" width="75" height="16" rx="4" fill="#293e51"/>
+  <text x="17" y="187" fill="#8fc7f2" font-family="sans-serif" font-size="9">Beads</text>
+  <g stroke="#525c6c" stroke-width="3" stroke-linecap="round">
+    <path d="M108 51h158M117 70h187M117 89h164M108 121h166M117 140h186"/>
+  </g>
+  <g fill="#e4bd7b"><circle cx="108" cy="70" r="2"/><circle cx="108" cy="89" r="2"/><circle cx="108" cy="140" r="2"/></g>
+</svg>

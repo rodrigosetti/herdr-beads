@@ -12,9 +12,22 @@ cd /path/to/project
 go-bd --dashboard
 ```
 
-The installer copies `beads-dashboard` and `bead-detail` into `${HERDR_APP_HOME:-~/.config/herdr-app}/mods` and updates `~/.local/bin/go-bd`. Reinstall from this directory to apply source changes. Keep `~/.local/bin` on PATH. `HERDR_APP_HOME` selects a different Herdr window/configuration.
+The installer copies `beads-dashboard`, `bead-detail`, and `beads-sidebar` into `${HERDR_APP_HOME:-~/.config/herdr-app}/mods`, installs the personal `beads-workspace` layout, and updates `~/.local/bin/go-bd`. An existing personal layout file is preserved on reinstall. Keep `~/.local/bin` on PATH. `HERDR_APP_HOME` selects a different Herdr window/configuration.
 
 `go-bd --dashboard` opens or focuses the project's Beads tab in its main-checkout space. The dashboard stays pinned to that project when another pane changes directory. Invoking the command from a linked worktree or nested folder resolves the same main checkout and database.
+
+### Sidebar button
+
+Switch to the personal layout once:
+
+```sh
+herdr-app do layout.switch --name beads-workspace
+```
+
+Click **Beads** above Settings in the sidebar. It opens a dashboard tab inside the currently selected space, using that space's first terminal's live folder. If the space already has a Beads dashboard, the button selects its existing tab and focuses the dashboard pane instead of creating a duplicate. The button remains available as an icon when the sidebar is collapsed and highlights while its dashboard tab is selected.
+
+Unlike the sidebar button, `go-bd --dashboard` opens the dashboard in the project's main-checkout space. Both views use the same shared project database. Herdr remembers the selected layout across restarts; switching back to `main` restores the shipped interface without removing any tabs or sessions.
+
 
 ## Dashboard
 
@@ -66,6 +79,7 @@ Per-project launch locks and terminal/dashboard receipts live under `${XDG_STATE
 ```sh
 herdr-app check ~/.config/herdr-app/mods/beads-dashboard
 herdr-app check ~/.config/herdr-app/mods/bead-detail
+herdr-app check ~/.config/herdr-app/mods/beads-sidebar
 node --test integrations/herdr-beads/model.test.mjs
 ```
 

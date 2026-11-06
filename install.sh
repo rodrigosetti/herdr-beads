@@ -5,7 +5,7 @@ source_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 app_home="${HERDR_APP_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr-app}"
 bin_home="$HOME/.local/bin"
 
-for mod in beads-dashboard bead-detail; do
+for mod in beads-dashboard bead-detail beads-sidebar; do
   mkdir -p "$app_home/mods/$mod"
   cp -f "$source_dir/mods/$mod/"*.js "$app_home/mods/$mod/"
   cp -f "$source_dir/mods/$mod/mod.json" "$app_home/mods/$mod/mod.json"
@@ -13,4 +13,9 @@ done
 mkdir -p "$bin_home"
 cp -f "$source_dir/bin/go-bd" "$bin_home/go-bd"
 chmod +x "$bin_home/go-bd"
-printf 'Installed Beads dashboard and detail mods in %s\nLauncher: %s/go-bd\nOpen from a project: go-bd --dashboard\n' "$app_home" "$bin_home"
+mkdir -p "$app_home/layouts"
+if [[ ! -e "$app_home/layouts/beads-workspace.json" ]]; then
+  cp -f "$source_dir/layouts/beads-workspace.json" "$app_home/layouts/beads-workspace.json"
+fi
+cp -f "$source_dir/layouts/beads-workspace.svg" "$app_home/layouts/beads-workspace.svg"
+printf 'Installed Beads mods in %s\nLauncher: %s/go-bd\nSidebar button: herdr-app do layout.switch --name beads-workspace\nOpen from a project: go-bd --dashboard\n' "$app_home" "$bin_home"
