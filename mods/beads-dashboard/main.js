@@ -34,13 +34,33 @@ export default class BeadsDashboard extends View {
     this.navigationIssues = [];
     this.navigationGeneration = 0;
     this.scroll = VirtualListScrollHandle.new();
+    this.rowEntities = new Map();
+    this.rowSnapshot = "";
+    this.actions = [];
+    const dashboard = this;
+    this.RowView = class extends View {
+      init(row) { this.row = row; }
+      update(row) { this.row = row; }
+      render() { return dashboard.row(this.row, dashboard.sessionMap(), theme()); }
+    };
+    // Row views have their own context; process their actions in the dashboard's task.
+    cx.spawn(async (cx) => {
+      for (;;) {
+        if (!this.actions.length) await new Promise((resolve) => { this.wakeAction = resolve; });
+        while (this.actions.length) this.actions.shift()(cx);
+      }
+    });
     this.handle = cx.focus_handle();
     this.refresh(cx);
     cx.timer.every(10000, (cx) => this.refresh(cx));
     cx.spawn(async (cx) => {
       for (;;) {
         const command = await nextCommand();
-        if (command === "focus") this.handle.focus();
+        if (command === "focus") {
+          this.tab = focused()?.tab ?? this.tab;
+          this.observedSelection = null;
+          this.handle.focus();
+        }
         else if (command === "refresh") this.refresh(cx);
         else if (command === "filter:all" || command === "filter:ready") this.setMode(command.slice(7), cx);
         else if (command.startsWith("select:")) this.select(command.slice(7), cx);
@@ -116,8 +136,8 @@ export default class BeadsDashboard extends View {
 
   ownPane() {
     const all = panes();
-    return all.find((pane) => pane.mod === "beads-dashboard" && pane.tab === this.tab)
-      ?? all.find((pane) => pane.mod === "beads-dashboard" && pane.focused);
+    return all.find((pane) => pane.mod === "beads-dashboard" && pane.focused)
+      ?? all.find((pane) => pane.mod === "beads-dashboard" && pane.tab === this.tab);
   }
 
   synchronize(cx) {
@@ -151,8 +171,34 @@ export default class BeadsDashboard extends View {
     });
   }
 
+  dispatch(action) {
+    this.actions.push(action);
+    this.wakeAction?.();
+    this.wakeAction = null;
+  }
+
+  synchronizeRows(rows, sessions) {
+    const snapshot = JSON.stringify([rows, [...sessions], [...this.ready], [...this.blocked], [...this.starting], this.selected]);
+    if (snapshot === this.rowSnapshot) return;
+    this.rowSnapshot = snapshot;
+    this.dispatch((cx) => {
+      if (this.rowSnapshot !== snapshot) return;
+      const present = new Set(rows.map((row) => row.issue.id));
+      for (const [id, entity] of this.rowEntities) {
+        if (!present.has(id)) { entity.release(); this.rowEntities.delete(id); }
+      }
+      for (const row of rows) {
+        const entity = this.rowEntities.get(row.issue.id);
+        if (entity) entity.set_props(row);
+        else this.rowEntities.set(row.issue.id, cx.new(this.RowView, row));
+      }
+      cx.notify();
+    });
+  }
+
   close() {
     this.scroll.release();
+    for (const entity of this.rowEntities.values()) entity.release();
   }
 
   select(id, cx) {
@@ -207,7 +253,7 @@ export default class BeadsDashboard extends View {
     return div().id(id).flex_none().px(10).py(6).rounded(6).border(1).border_color(active ? t.accent : t.border)
       .bg(active ? t.selected : t.surface).text_color(active ? t.foreground : t.muted).text_size(12).cursor_pointer()
       .when(active, (element) => element.font_semibold())
-      .hover((style) => style.bg(t.hover).text_color(t.foreground)).on_click((_event, cx) => { cx.stop_propagation(); action(cx); }).child(label);
+      .hover((style) => style.bg(t.hover).text_color(t.foreground)).on_click((_event, cx) => { cx.stop_propagation(); this.dispatch(action); }).child(label);
   }
 
   row(row, sessions, t) {
@@ -219,8 +265,10 @@ export default class BeadsDashboard extends View {
     const fold = div().id(`fold-${issue.id}`).w(16).flex_none().text_color(t.dim)
       .when(children > 0, (element) => element.cursor_pointer().on_click((_event, cx) => {
         cx.stop_propagation();
-        this.folded.has(issue.id) ? this.folded.delete(issue.id) : this.folded.add(issue.id);
-        this.save(); cx.notify();
+        this.dispatch((cx) => {
+          this.folded.has(issue.id) ? this.folded.delete(issue.id) : this.folded.add(issue.id);
+          this.save(); cx.notify();
+        });
       })).child(children ? folded ? "▸" : "▾" : "");
     const title = div().flex_1().min_w(0).truncate().text_size(13).text_color(context ? t.muted : t.foreground)
       .when(issue.issue_type === "epic", (element) => element.font_semibold()).tooltip(issue.title).child(issue.title);
@@ -237,7 +285,7 @@ export default class BeadsDashboard extends View {
       : div().flex_none().w(58);
     return h_flex().id(`bead-${issue.id}`).flex_none().h(68).pl(10 + Math.min(depth, 8) * 18).pr(12).py(10).gap(8).items_center()
       .border_b(1).border_color(t.border).cursor_pointer().bg(this.selected === issue.id ? t.selected : issue.issue_type === "epic" ? t.surface : t.background)
-      .hover((style) => style.bg(t.hover)).on_click((_event, cx) => this.select(issue.id, cx))
+      .hover((style) => style.bg(t.hover)).on_click(() => this.dispatch((cx) => this.select(issue.id, cx)))
       .child(fold)
       .child(div().w(27).flex_none().text_size(11).font_semibold().text_color(priorityColor).child(`P${issue.priority ?? "?"}`))
       .child(v_flex().flex_1().min_w(0).gap(5).child(title).child(info))
@@ -264,6 +312,7 @@ export default class BeadsDashboard extends View {
       this.save();
     }
     const { rows, count, counts } = issueRows(issues, this.ready, { mode: this.mode, folded: this.folded, reveal: this.selected });
+    this.synchronizeRows(rows, sessions);
     const index = this.revealPending ? rows.findIndex((row) => row.issue.id === this.revealPending) : -1;
     if (index >= 0) { this.scroll.scroll_to_item(index, "center"); this.revealPending = null; }
     const name = this.project?.folder.replace(/[\\/]$/, "").split(/[\\/]/).pop() || "Project";
@@ -281,11 +330,17 @@ export default class BeadsDashboard extends View {
         .child(div().text_size(11).text_color(t.muted).child(this.loaded ? `${count} ${count === 1 ? "issue" : "issues"} · ${sessions.size} with live ${sessions.size === 1 ? "session" : "sessions"}` : "Loading project…")))
       .when(!!this.error, (element) => element.child(div().flex_none().px(16).py(10).bg(t.surface).text_color(t.blocked).child(`${this.error}${this.loaded ? " — showing last successful refresh" : ""}`)))
       .when(!!this.notice, (element) => element.child(div().flex_none().px(16).py(8).text_size(12).text_color(t.done).child(this.notice)))
-      .child(v_flex().flex_1().min_h(0).relative()
+      .child(v_flex().id("beads-viewport").flex_1().min_h(0).relative().overflow_hidden()
+        .on_size_change((size, cx) => {
+          if (this.viewportHeight !== size.height) { this.viewportHeight = size.height; cx.notify(); }
+        })
         .when(rows.length > 0, (element) => element
           .child(v_virtual_list("beads-list", rows.length, 68, (index) => rows[index].issue.id,
-            (range) => rows.slice(range.start, range.end).map((row) => this.row(row, sessions, t)))
-            .size_full().track_scroll(this.scroll))
+            (range) => rows.slice(range.start, range.end).map((row) => {
+              const entity = this.rowEntities.get(row.issue.id);
+              return div().h(68).when(!!entity, (element) => element.child(entity));
+            }))
+            .w_full().h(this.viewportHeight ?? 0).track_scroll(this.scroll))
           .child(Scrollbar.vertical("beads-list").absolute().inset_0()))
         .when(!rows.length, (element) => element.child(v_flex().p(24).gap(8)
           .child(div().text_color(t.muted).child(!this.loaded ? this.loading ? "Loading beads…" : "Could not load this project." : this.mode === "ready" ? "No ready or in-progress issues." : "No open issues.")))))
