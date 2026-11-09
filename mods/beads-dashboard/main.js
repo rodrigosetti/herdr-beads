@@ -28,6 +28,7 @@ export default class BeadsDashboard extends View {
     this.folded = new Set();
     this.mode = "all";
     this.error = "";
+    this.reconciliationError = "";
     this.notice = "";
     this.loading = false;
     this.loaded = false;
@@ -44,15 +45,11 @@ export default class BeadsDashboard extends View {
       update(row) { this.row = row; }
       render() { return dashboard.row(this.row, dashboard.sessionMap(), theme()); }
     };
-    // Row views have their own context; process their actions in the dashboard's task.
-    cx.spawn(async (cx) => {
-      for (;;) {
-        if (!this.actions.length) await new Promise((resolve) => { this.wakeAction = resolve; });
-        // A JS wake can resume inside a row's host call. Yield to the dashboard's
-        // native task before creating entities, or releasing that row releases siblings.
-        await cx.sleep(0);
-        while (this.actions.length) this.actions.shift()(cx);
-      }
+    // Native timer callbacks enter the dashboard's ownership scope. A promise
+    // woken by a row keeps that row's scope even after cx.sleep().
+    // Idle ticks do not notify or redraw; render only queues reconciliation.
+    cx.timer.every(50, (cx) => {
+      while (this.actions.length) this.actions.shift()(cx);
     });
     this.handle = cx.focus_handle();
     this.refresh(cx);
@@ -96,7 +93,14 @@ export default class BeadsDashboard extends View {
           this.mode = saved.mode === "ready" ? "ready" : "all";
           this.folded = new Set(saved.folded ?? []);
         }
-        const reconciliation = checked(await exec("go-bd", ["--reconcile-epics", "--json"], { cwd: this.project.folder, on: this.machine }), "go-bd");
+        try {
+          const reconciliation = checked(await exec("go-bd", ["--reconcile-epics", "--json"], { cwd: this.project.folder, on: this.machine }), "go-bd");
+          this.epics = reconciliation.epics;
+          this.reconciliationError = reconciliation.errors.map(({ id, error }) => `${id}: ${error}`).join("\n");
+        } catch (error) {
+          // Reconciliation can contend with another dashboard; browsing must still work.
+          this.reconciliationError = String(error.message ?? error);
+        }
         const [issues, blocked, ready] = await Promise.all([
           this.bd(["list", "--status", "open,in_progress,blocked,deferred", "--limit", "0", "--sort", "priority", "--brief"]),
           this.bd(["blocked"]),
@@ -113,14 +117,13 @@ export default class BeadsDashboard extends View {
           for (const parent of parents) byId.set(parent.id, { ...parent, context: true });
         }
         this.issues = [...byId.values()];
-        this.epics = reconciliation.epics;
         if (this.selected && !byId.has(this.selected) && !this.navigationIssues.some((issue) => issue.id === this.selected)) this.observedSelection = null;
         this.blocked = new Set(blocked.map((issue) => issue.id));
         for (const issue of issues) if (issue.status === "blocked") this.blocked.add(issue.id);
         this.ready = new Set(ready.map((issue) => issue.id));
         this.loaded = true;
         this.updated = new Date().toLocaleTimeString();
-        this.error = reconciliation.errors.map(({ id, error }) => `${id}: ${error}`).join("\n");
+        this.error = "";
       } catch (error) {
         this.error = String(error.message ?? error);
       } finally {
@@ -179,8 +182,6 @@ export default class BeadsDashboard extends View {
 
   dispatch(action) {
     this.actions.push(action);
-    this.wakeAction?.();
-    this.wakeAction = null;
   }
 
   synchronizeRows(rows, sessions) {
@@ -341,6 +342,7 @@ export default class BeadsDashboard extends View {
           .child(this.button("filter-ready", `Ready · ${counts.ready}`, (cx) => this.setMode("ready", cx), t, this.mode === "ready")))
         .child(div().text_size(11).text_color(t.muted).child(this.loaded ? `${count} ${count === 1 ? "issue" : "issues"} · ${sessions.size} with live ${sessions.size === 1 ? "session" : "sessions"}` : "Loading project…")))
       .when(!!this.error, (element) => element.child(div().flex_none().px(16).py(10).bg(t.surface).text_color(t.blocked).child(`${this.error}${this.loaded ? " — showing last successful refresh" : ""}`)))
+      .when(!!this.reconciliationError, (element) => element.child(div().flex_none().px(16).py(10).bg(t.surface).text_color(t.blocked).child(`Epic reconciliation failed: ${this.reconciliationError}`)))
       .when(!!this.notice, (element) => element.child(div().flex_none().px(16).py(8).text_size(12).text_color(t.done).child(this.notice)))
       .child(v_flex().id("beads-viewport").flex_1().min_h(0).relative().overflow_hidden()
         .on_size_change((size, cx) => {
