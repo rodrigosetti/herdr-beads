@@ -22,6 +22,7 @@ export default class BeadsDashboard extends View {
     this.tab = focus?.tab;
     this.project = null;
     this.issues = [];
+    this.epics = [];
     this.blocked = new Set();
     this.ready = new Set();
     this.folded = new Set();
@@ -69,6 +70,7 @@ export default class BeadsDashboard extends View {
           this.mode = saved.mode === "ready" ? "ready" : "all";
           this.folded = new Set(saved.folded ?? []);
         }
+        const reconciliation = checked(await exec("go-bd", ["--reconcile-epics", "--json"], { cwd: this.project.folder, on: this.machine }), "go-bd");
         const [issues, blocked, ready] = await Promise.all([
           this.bd(["list", "--status", "open,in_progress,blocked,deferred", "--limit", "0", "--sort", "priority", "--brief"]),
           this.bd(["blocked"]),
@@ -85,12 +87,13 @@ export default class BeadsDashboard extends View {
           for (const parent of parents) byId.set(parent.id, { ...parent, context: true });
         }
         this.issues = [...byId.values()];
+        this.epics = reconciliation.epics;
         this.blocked = new Set(blocked.map((issue) => issue.id));
         for (const issue of issues) if (issue.status === "blocked") this.blocked.add(issue.id);
         this.ready = new Set(ready.map((issue) => issue.id));
         this.loaded = true;
         this.updated = new Date().toLocaleTimeString();
-        this.error = "";
+        this.error = reconciliation.errors.map(({ id, error }) => `${id}: ${error}`).join("\n");
       } catch (error) {
         this.error = String(error.message ?? error);
       } finally {
@@ -144,7 +147,8 @@ export default class BeadsDashboard extends View {
     const existing = this.sessionMap().get(id);
     if (existing?.length) { this.focusSession(existing[0]); return; }
     if (!issueAction(issue, { blocked: this.blocked.has(id) })) {
-      this.error = `${id} is not available to start. Resolve its blockers or deferred status first.`;
+      this.error = issue.issue_type === "epic" ? `${id} is an epic. Start one of its child issues instead.`
+        : `${id} is not available to start. Resolve its blockers or deferred status first.`;
       cx.notify();
       return;
     }
@@ -172,7 +176,7 @@ export default class BeadsDashboard extends View {
   }
 
   row(row, sessions, t) {
-    const { issue, depth, context, children, folded } = row;
+    const { issue, depth, context, children, folded, progress } = row;
     const live = sessions.get(issue.id) ?? [], session = live[0];
     const blocked = this.blocked.has(issue.id), ready = this.ready.has(issue.id), busy = this.starting.has(issue.id);
     const decision = issueAction(issue, { session, blocked, context });
@@ -190,10 +194,12 @@ export default class BeadsDashboard extends View {
       .child(div().flex_none().text_color(t.muted).child(issue.issue_type))
       .child(div().flex_none().text_color(ready ? t.ansi2 : issue.status === "in_progress" ? t.working : t.muted)
         .child(ready ? "Ready" : statusLabels[issue.status] ?? issue.status))
+      .when(!!progress, (element) => element.child(div().flex_none().text_color(t.muted)
+        .child(`${progress.completed}/${progress.total} children closed`)))
       .when(blocked, (element) => element.child(div().text_color(t.blocked).child("Dependency blocked")))
       .when(context, (element) => element.child(div().child("Group context")));
     const action = decision === "focus" ? this.button(`go-${issue.id}`, "Go to session", () => this.focusSession(session), t)
-      : busy ? div().flex_none().text_size(12).text_color(t.muted).frames(decision === "resume" ? ["Resuming", "Resuming ·", "Resuming ··"] : ["Starting", "Starting ·", "Starting ··"], 300)
+      : busy && decision ? div().flex_none().text_size(12).text_color(t.muted).frames(decision === "resume" ? ["Resuming", "Resuming ·", "Resuming ··"] : ["Starting", "Starting ·", "Starting ··"], 300)
       : decision ? this.button(`start-${issue.id}`, decision === "resume" ? "Resume" : "Start", (cx) => this.launch(issue.id, cx), t)
       : div().flex_none().w(58);
     return h_flex().id(`bead-${issue.id}`).flex_none().min_h(68).pl(10 + Math.min(depth, 8) * 18).pr(12).py(10).gap(8).items_center()
@@ -211,7 +217,7 @@ export default class BeadsDashboard extends View {
 
   render(cx) {
     const t = theme(), sessions = this.sessionMap();
-    const { rows, count, counts } = issueRows(this.issues, this.ready, { mode: this.mode, folded: this.folded });
+    const { rows, count, counts } = issueRows(this.issues, this.ready, { mode: this.mode, folded: this.folded, epics: this.epics });
     const name = this.project?.folder.replace(/[\\/]$/, "").split(/[\\/]/).pop() || "Project";
     return v_flex().id("beads-dashboard").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(13)
       .track_focus(this.handle).on_mouse_down("left", () => this.handle.focus())

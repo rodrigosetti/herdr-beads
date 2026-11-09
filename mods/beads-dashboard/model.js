@@ -1,8 +1,9 @@
 const priority = (issue) => Number.isFinite(issue.priority) ? issue.priority : 5;
 const compare = (a, b) => priority(a) - priority(b) || a.id.localeCompare(b.id);
 
-export function issueRows(issues, ready, { mode = "all", folded = new Set() } = {}) {
+export function issueRows(issues, ready, { mode = "all", folded = new Set(), epics = [] } = {}) {
   const byId = new Map(issues.map((issue) => [issue.id, issue]));
+  const childProgress = new Map(epics.map((epic) => [epic.id, { completed: epic.closed_children, total: epic.total_children }]));
   const open = issues.filter((issue) => !issue.context && issue.status !== "closed");
   const readyIssues = open.filter((issue) => ready.has(issue.id) || issue.status === "in_progress");
   const matches = mode === "ready" ? readyIssues : open;
@@ -33,7 +34,8 @@ export function issueRows(issues, ready, { mode = "all", folded = new Set() } = 
     if (visited.has(issue.id)) return;
     visited.add(issue.id);
     const nested = children.get(issue.id) ?? [];
-    rows.push({ issue, depth, context: !matched.has(issue.id), children: nested.length, folded: folded.has(issue.id) });
+    const progress = issue.issue_type === "epic" ? childProgress.get(issue.id) ?? null : null;
+    rows.push({ issue, depth, context: !matched.has(issue.id), children: nested.length, folded: folded.has(issue.id), progress });
     if (folded.has(issue.id)) {
       const hide = (id) => {
         if (visited.has(id)) return;
@@ -51,6 +53,7 @@ export function issueRows(issues, ready, { mode = "all", folded = new Set() } = 
 
 export function issueAction(issue, { session, blocked = false, context = issue.context } = {}) {
   if (session) return "focus";
+  if (issue.issue_type === "epic") return null;
   if (context || blocked || !["open", "in_progress"].includes(issue.status)) return null;
   // Presence, not validity: the launcher must report malformed saved sessions.
   if (issue.status === "in_progress" && Object.prototype.hasOwnProperty.call(issue.metadata ?? {}, "omp_session")) return "resume";

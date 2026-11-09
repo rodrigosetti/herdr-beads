@@ -3,17 +3,37 @@ import copy
 import json
 from pathlib import Path
 import runpy
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).parent / "bin"))
 
 launcher = runpy.run_path(str(Path(__file__).parent / "bin/go-bd"))
 saved_session = launcher["saved_session"]
 startup_receipt = launcher["startup_receipt"]
 LaunchError = launcher["LaunchError"]
 confirm_started = launcher["confirm_started"]
+
+
+class EpicSessionTests(unittest.TestCase):
+    def test_epics_refuse_before_claim_or_session_side_effects(self):
+        for status in ("open", "in_progress", "closed", "deferred", "blocked"):
+            for metadata in ({}, {"omp_session": {"session_id": "legacy"}}):
+                issue = {"id": "example-epic", "issue_type": "epic",
+                         "status": status, "metadata": metadata}
+                for name, args in (
+                    ("claim", (None, issue)),
+                    ("prepare_session", (None, issue, "omp")),
+                    ("launch_herdr", (None, issue, "omp")),
+                ):
+                    with self.subTest(status=status, metadata=metadata, boundary=name):
+                        original = copy.deepcopy(issue)
+                        with self.assertRaisesRegex(LaunchError, "sessionless container"):
+                            launcher[name](*args)
+                        self.assertEqual(issue, original)
 
 
 class PersistentSessionTests(unittest.TestCase):

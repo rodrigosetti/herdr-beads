@@ -17,6 +17,8 @@ import signal
 import uuid
 import time
 
+from beads_epics import EpicReconcileError, reconcile_epics
+
 
 class LaunchError(Exception):
     pass
@@ -59,6 +61,8 @@ def require_binary(name):
 
 
 class Project:
+    bd_error_type = LaunchError
+
     def __init__(self):
         # Ignore an unrelated inherited BEADS_DIR. Git's common directory selects
         # the main checkout even when invoked from a linked worktree/subdirectory.
@@ -228,7 +232,16 @@ def existing_session(project, issue_id, record, spaces):
     return None
 
 
+def require_executable_issue(issue):
+    if issue.get("issue_type") == "epic":
+        raise LaunchError(
+            f"Epic {issue['id']} is a sessionless container; "
+            "start a concrete child task (including planning or investigation) instead."
+        )
+
+
 def claim(project, issue):
+    require_executable_issue(issue)
     issue_id = issue["id"]
     if issue.get("status") == "in_progress":
         # Ready intentionally excludes in-progress issues. Allow a same-owner
@@ -311,6 +324,7 @@ def session_arguments(omp, extension, previous):
 
 
 def prepare_session(project, issue, omp):
+    require_executable_issue(issue)
     machine = machine_id()
     previous = saved_session(issue, machine)
     extension = Path(__file__).resolve().with_name("go-bd-session.mjs")
@@ -450,6 +464,7 @@ def confirm_started(address, ack):
 
 
 def launch_herdr(project, issue, omp):
+    require_executable_issue(issue)
     issue_id = issue["id"]
     record_name = f"issue-{issue_id}"
     spaces = layout()  # Fail before claiming if this machine has no Herdr window.
@@ -521,23 +536,28 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--herdr", metavar="ID", help="start or focus this issue's Herdr omp session")
     mode.add_argument("--dashboard", action="store_true", help="open or reuse this project's Beads dashboard")
+    mode.add_argument("--reconcile-epics", action="store_true",
+                      help="reconcile epic status from direct children and report progress")
     parser.add_argument("--json", action="store_true", help="emit the Herdr result as one JSON object")
     parser.add_argument("issue", nargs="?", help="issue to claim and run directly with omp")
     args = parser.parse_args()
-    if (args.herdr or args.dashboard) and args.issue:
-        parser.error("use either a direct issue ID, --herdr ID, or --dashboard")
-    if not (args.herdr or args.dashboard or args.issue):
-        parser.error("an issue ID or --dashboard is required")
+    if (args.herdr or args.dashboard or args.reconcile_epics) and args.issue:
+        parser.error("use either a direct issue ID, --herdr ID, --dashboard, or --reconcile-epics")
+    if not (args.herdr or args.dashboard or args.reconcile_epics or args.issue):
+        parser.error("an issue ID, --dashboard, or --reconcile-epics is required")
     if args.json and args.issue:
-        parser.error("--json requires --herdr ID or --dashboard")
+        parser.error("--json requires --herdr ID, --dashboard, or --reconcile-epics")
     require_binary("git")
     require_binary("bd")
     if args.herdr or args.dashboard:
         require_binary("herdr-app")
         require_binary("hc")
-    omp = require_binary("omp") if not args.dashboard else None
+    omp = require_binary("omp") if args.herdr or args.issue else None
     project = Project()
-    if args.dashboard:
+    if args.reconcile_epics:
+        with project.lock("epics"):
+            result = reconcile_epics(project)
+    elif args.dashboard:
         with project.lock("dashboard"):
             result = dashboard(project)
     else:
@@ -547,6 +567,7 @@ def main():
             raise LaunchError(f"Issue ID cannot safely name a worktree: {issue_id!r}")
         with project.lock(f"issue-{issue_id}"):
             issue = project.show(issue_id)
+            require_executable_issue(issue)
             if args.herdr:
                 result = launch_herdr(project, issue, omp)
             else:
@@ -566,6 +587,9 @@ def main():
             sys.exit(process.wait())
     if args.json:
         print(json.dumps(result, ensure_ascii=False))
+    elif args.reconcile_epics:
+        for epic in result["epics"]:
+            print(f"{epic['id']}: {epic['closed_children']}/{epic['total_children']} children closed · {epic['status']}")
     else:
         print(f"{result['action'].capitalize()} {result.get('issue', 'Beads dashboard')} "
               f"in Herdr ({result['space']} / {result['tab']})")
@@ -574,7 +598,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (LaunchError, OSError) as error:
+    except (LaunchError, EpicReconcileError, OSError) as error:
         print(f"go-bd: {error}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:

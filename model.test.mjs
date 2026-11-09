@@ -133,14 +133,14 @@ test("multiple live sessions preserve attention precedence and exclude finished 
 test("live sessions take precedence over saved sessions and launch restrictions", () => {
   const saved = { omp_session: { session_id: "actual-id", session_file: "/sessions/actual.jsonl", machine: "local", worktree: "/worktree" } };
   for (const status of ["open", "in_progress", "blocked", "deferred", "closed"]) {
-    const item = issue("work", 1, null, { status, metadata: saved });
+    const item = issue("work", 1, null, { issue_type: "task", status, metadata: saved });
     assert.equal(issueAction(item, { session: { address: "t1" }, blocked: true, context: true }), "focus");
   }
 });
 
 test("only unblocked noncontext in-progress issues with a saved key offer Resume", () => {
   const saved = { omp_session: { session_id: "actual-id", session_file: "/sessions/actual.jsonl", machine: "local", worktree: "/worktree" } };
-  const working = issue("work", 1, null, { status: "in_progress", metadata: saved });
+  const working = issue("work", 1, null, { issue_type: "task", status: "in_progress", metadata: saved });
   assert.equal(issueAction(working), "resume");
   assert.equal(issueAction(working, { blocked: true }), null);
   assert.equal(issueAction(working, { context: true }), null);
@@ -156,13 +156,13 @@ test("only unblocked noncontext in-progress issues with a saved key offer Resume
 
 test("malformed saved records still offer Resume so the launcher can report their errors", () => {
   for (const omp_session of [null, false, 0, "", "old-id", [], {}, { session_id: "incomplete" }]) {
-    const working = issue("work", 1, null, { status: "in_progress", metadata: { unrelated: "preserved", omp_session } });
+    const working = issue("work", 1, null, { issue_type: "task", status: "in_progress", metadata: { unrelated: "preserved", omp_session } });
     assert.equal(issueAction(working), "resume");
   }
 });
 
 test("finished and recovered terminals fall back to the persistent session rather than focus", () => {
-  const working = issue("work", 1, null, { status: "in_progress", metadata: { omp_session: { session_id: "saved" } } });
+  const working = issue("work", 1, null, { issue_type: "task", status: "in_progress", metadata: { omp_session: { session_id: "saved" } } });
   const terminal = { address: "t1", state: "live", foreground: { name: "omp" }, labels: { "beads.project": "/p/.beads", "beads.issue": working.id } };
   for (const change of [{ state: "finished" }, { foreground: { name: "zsh" } }]) {
     const sessions = issueSessions("/p/.beads", null, [{ ...terminal, ...change }], [{ address: "t1", status: "working" }]);
@@ -170,4 +170,94 @@ test("finished and recovered terminals fall back to the persistent session rathe
   }
   const sessions = issueSessions("/p/.beads", null, [terminal], [{ address: "t1", status: "working" }]);
   assert.equal(issueAction(working, { session: sessions.get(working.id)?.[0] }), "focus");
+});
+
+test("epics never offer Start or Resume, including saved and malformed sessions", () => {
+  for (const status of ["open", "in_progress", "blocked", "deferred", "closed"]) {
+    for (const metadata of [undefined, {}, { omp_session: null }, { omp_session: "old-id" }, { omp_session: { session_id: "saved" } }]) {
+      const epic = issue("epic", 0, null, { status, metadata });
+      for (const options of [{}, { blocked: true }, { context: true }]) {
+        assert.equal(issueAction(epic, options), null);
+      }
+      assert.equal(issueAction(epic, { session: { address: "legacy-live" }, blocked: true, context: true }), "focus");
+    }
+  }
+});
+
+test("finished or recovered legacy epic terminals never become a creation action", () => {
+  const epic = issue("epic", 0, null, { status: "in_progress", metadata: { omp_session: { session_id: "saved" } } });
+  const terminal = { address: "t1", state: "live", foreground: { name: "omp" }, labels: { "beads.project": "/p/.beads", "beads.issue": epic.id } };
+  for (const change of [{ state: "finished" }, { foreground: { name: "zsh" } }]) {
+    const sessions = issueSessions("/p/.beads", null, [{ ...terminal, ...change }], [{ address: "t1", status: "working" }]);
+    assert.equal(issueAction(epic, { session: sessions.get(epic.id)?.[0] }), null);
+  }
+});
+
+test("epic progress uses authoritative direct-child counts regardless of Ready and folding", () => {
+  const data = [
+    issue("epic", 0),
+    issue("ready-child", 1, "epic"),
+    issue("nested", 2, "epic", { issue_type: "epic" }),
+    issue("grandchild", 0, "nested", { status: "blocked" }),
+    issue("closed-child", 3, "epic", { status: "closed" }),
+  ];
+  // The snapshot also includes closed children absent from the displayed issue list.
+  const epics = [
+    { id: "epic", total_children: 4, closed_children: 2 },
+    { id: "nested", total_children: 2, closed_children: 1 },
+  ];
+  for (const mode of ["all", "ready"]) {
+    for (const folded of [new Set(), new Set(["epic"])]) {
+      const result = issueRows(data, new Set(["ready-child"]), { mode, folded, epics });
+      assert.deepEqual(result.rows.find(({ issue }) => issue.id === "epic").progress, { completed: 2, total: 4 });
+      assert.equal(result.count, mode === "all" ? 4 : 1);
+      assert.deepEqual(result.counts, { all: 4, ready: 1 });
+      assert.ok(!result.rows.some(({ issue }) => issue.id === "closed-child"));
+      if (folded.has("epic")) assert.equal(result.rows.length, 1);
+    }
+  }
+  const rows = issueRows(data, new Set(), { epics }).rows;
+  assert.deepEqual(rows.find(({ issue }) => issue.id === "nested").progress, { completed: 1, total: 2 });
+  assert.equal(rows.find(({ issue }) => issue.id === "ready-child").progress, null);
+});
+
+test("empty and all-closed epics retain explicit progress without exposing closed children", () => {
+  const data = [
+    issue("empty", 0),
+    issue("complete", 1),
+    issue("closed-child", 0, "complete", { status: "closed" }),
+    issue("closed-unrelated", 0, null, { status: "closed" }),
+  ];
+  const epics = [
+    { id: "empty", total_children: 0, closed_children: 0 },
+    { id: "complete", total_children: 2, closed_children: 2 },
+    { id: "closed-unrelated", total_children: 1, closed_children: 1 },
+  ];
+  const result = issueRows(data, new Set(), { epics });
+  assert.deepEqual(result.rows.map(({ issue, progress }) => [issue.id, progress]), [
+    ["empty", { completed: 0, total: 0 }],
+    ["complete", { completed: 2, total: 2 }],
+  ]);
+  assert.deepEqual(result.counts, { all: 2, ready: 0 });
+  assert.equal(issueRows([issue("unknown", 0)], new Set()).rows[0].progress, null);
+});
+
+test("closed epic context receives its own snapshot and reopened progress can decrease", () => {
+  const data = [
+    issue("closed-epic", 0, null, { status: "closed", context: true }),
+    issue("reopened-child", 1, "closed-epic"),
+    issue("closed-child", 2, "closed-epic", { status: "closed" }),
+  ];
+  for (const mode of ["all", "ready"]) {
+    for (const closed_children of [2, 1]) {
+      const epics = [{ id: "closed-epic", total_children: 2, closed_children }];
+      const result = issueRows(data, new Set(["reopened-child"]), { mode, epics });
+      assert.deepEqual(result.rows.map(({ issue, context, progress }) => [issue.id, context, progress]), [
+        ["closed-epic", true, { completed: closed_children, total: 2 }],
+        ["reopened-child", false, null],
+      ]);
+      assert.equal(result.count, 1);
+      assert.deepEqual(result.counts, { all: 1, ready: 1 });
+    }
+  }
 });

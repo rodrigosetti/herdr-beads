@@ -2,6 +2,9 @@
 mods/*/gpui-kit.d.ts
 mods/*/jsconfig.json
 
+# Python launcher modules and regression tests.
+__pycache__/
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db

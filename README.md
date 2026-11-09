@@ -12,7 +12,7 @@ cd /path/to/project
 go-bd --dashboard
 ```
 
-The installer copies `beads-dashboard`, `bead-detail`, and `beads-sidebar` into `${HERDR_APP_HOME:-~/.config/herdr-app}/mods`, installs the personal `beads-workspace` layout, and updates `~/.local/bin/go-bd` together with its `go-bd-session.mjs` startup extension. Keep these two launcher files together. An existing personal layout file is preserved on reinstall. Keep `~/.local/bin` on PATH. `HERDR_APP_HOME` selects a different Herdr window/configuration.
+The installer copies `beads-dashboard`, `bead-detail`, and `beads-sidebar` into `${HERDR_APP_HOME:-~/.config/herdr-app}/mods`, installs the personal `beads-workspace` layout, and updates `~/.local/bin/go-bd` together with its `go-bd-session.mjs` startup extension and `beads_epics.py` policy module. Keep these three files together. An existing personal layout file is preserved on reinstall. Keep `~/.local/bin` on PATH. `HERDR_APP_HOME` selects a different Herdr window/configuration.
 
 `go-bd --dashboard` opens or focuses the project's Beads tab in its main-checkout space. The dashboard stays pinned to that project when another pane changes directory. Invoking the command from a linked worktree or nested folder resolves the same main checkout and database.
 
@@ -37,6 +37,7 @@ Unlike the sidebar button, `go-bd --dashboard` opens the dashboard in the projec
 - Click an issue to open its details on the right. Further selections reuse the same pane. Details have a title/status header, compact metadata and label pills, Markdown narrative sections, and relationship/comment cards. Remaining nonempty `bd show --long` fields stay available under Additional details. Dates are localized with original timestamps in tooltips; Beads' zero timestamps show Not recorded. Ready badges also apply to related issues. Refresh reloads issue data and readiness.
 - **All open** (the initial view) includes every non-closed issue, including blocked, in-progress, and deferred work. **Ready** shows the union of authoritative `bd ready` matches and all `in_progress` issues. In-progress issues keep their In progress status labels. Both buttons show counts without duplicates; ancestor context does not inflate them. Closed issues stay hidden except when needed as ancestor context.
 - Click a disclosure arrow to fold children. Folding and the selected All open / Ready filter are saved per machine/database. The old blocked-filter preference is ignored. There is no search field.
+- Epic rows show closed/total **direct children**, including closed children hidden from the list. Ready filtering and folding do not change those counts.
 - Beads queries refresh every ten seconds or via Refresh. A query failure is visible and does not replace the last good snapshot with an empty list.
 
 The mod uses Herdr's `exec` API to run the Beads CLI. It does not read exports, query Dolt directly, send issue data over the network, or maintain a second issue database. Live agent data comes from Herdr reactively. Project commands run on the space's machine; starting a remote session requires the launcher and a working Herdr window on that machine. Local worktree sessions are the verified configuration.
@@ -53,6 +54,18 @@ Start resolves the full issue ID, checks readiness/inherited blockers, claims at
 Worktree directories, agent tabs, and worktree space names use the full bead ID, such as `myproject-123`, without an additional repository-name prefix.
 
 A live associated Herdr omp session is focused instead of duplicated. Once that terminal ends, an unblocked, self-owned `in_progress` issue with saved session metadata resumes its exact conversation in the original worktree. The dashboard offers **Go to session**, **Resume**, or **Start**, in that order. In-progress issues without saved metadata still offer Start. Each launch pins `BEADS_DIR` to the main checkout's shared database. The launcher respects the repository's omp worktree configuration; configure `worktree.clone: false` when ignored Beads databases must not be copied. Existing foreign-repository/wrong-branch worktrees are refused.
+
+### Epics are containers
+
+Epics offer no Start or Resume action. Both direct and Herdr launch entrypoints reject epics before claiming or preparing a session/worktree. Start a concrete child task instead, including planning and investigation work. Existing legacy epic terminals remain focusable in the dashboard; their saved associations are preserved, not resumed or replaced.
+
+`go-bd --reconcile-epics --json` reconciles every epic in the canonical project database and returns progress plus per-epic errors. A nonempty epic closes when all direct children are closed. Reopening a child or adding unfinished work reopens its closed epic; empty epics stay open (previously closed empty epics reopen). Nested epics reconcile bottom-up. Only `closed` children count as complete; sessions, submissions, and merge evidence are not inputs. Normal Beads close gates remain enforced, and a refusal stays visible without blocking other epics.
+
+The current dashboard wakes this policy on refresh, nominally every ten seconds while active. This is **not background automation independent of Herdr**: a background-tab smoke did not reconcile until refreshed. The pending controller service must invoke `bin/beads_epics.py`'s `reconcile_epics(project)` on startup and periodic/child-change wakeups, including projects with no execution run.
+
+The installed Beads CLI cannot atomically guard the entire nonempty-child predicate. Reconciliation uses unforced `bd close` (not unchecked `bd epic close-eligible`), guarded reopening, and reread/repair. Concurrent child removal/reopening can require another pass; status is eventually convergent, not an instantaneous database invariant.
+
+### Session association
 
 The launcher labels the core terminal with `beads.project=<canonical .beads path>` and `beads.issue=<full issue ID>`. This explicit association survives app restarts. Sessions started before installation are not guessed from titles. To associate a known existing session manually:
 
@@ -88,7 +101,7 @@ Session states are independent of issue status:
 | Idle | Agent is not working; a previously unseen result may have been acknowledged |
 | Starting | omp is running but has not reported agent status yet |
 
-`Done · unseen` becomes `Idle` when acknowledged through Herdr. It never means the bead was closed. The launcher does not close issues, merge code, remove worktrees, or push. Follow the repository's merge/close policy.
+`Done · unseen` becomes `Idle` when acknowledged through Herdr. It never means the bead was closed. Session launching does not close tasks, merge code, remove worktrees, or push. Epic child-driven reconciliation is separate from session launching. Follow the repository's merge/close policy for executable work.
 
 Per-project launch locks and terminal/dashboard receipts live under `${XDG_STATE_HOME:-~/.local/state}/go-bd`. Concurrent launches are refused rather than duplicated. A failed or unconfirmed launch reports an error and preserves any claimed issue, worktree, and terminal for inspection; retry focuses a live omp session if one exists. Slow launches can exceed Herdr exec's 30-second limit: inspect the associated terminal before retrying.
 
@@ -101,6 +114,7 @@ herdr-app check ~/.config/herdr-app/mods/bead-detail
 herdr-app check ~/.config/herdr-app/mods/beads-sidebar
 node --test model.test.mjs
 python3 launcher_test.py
+python3 -m unittest epic_test
 ```
 
 The native check only covers the initial render. Also open the dashboard in Herdr, switch between All open and Ready, check Ready against the union of `bd ready --limit 0` and `in_progress` issues, and select two issues to confirm detail-pane reuse and formatted Markdown. Check that blocked, in-progress, and deferred issues remain available in All open and closed issues do not appear as matches. For changes to session launching, also exercise a real worktree agent. Session attention states must be observed in the running app, not inferred from an issue's `in_progress` field.
