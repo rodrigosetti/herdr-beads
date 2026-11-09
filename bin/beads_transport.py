@@ -248,6 +248,7 @@ class ControllerServer:
         self.controller = controller
         self.path = Path(socket_path) if socket_path is not None else default_socket_path()
         self.stopped = threading.Event()
+        self.wakeup = threading.Event()
         self.failure = None
         self.listener = None
         self.lock_fd = None
@@ -334,6 +335,8 @@ class ControllerServer:
                         response = _error(self.failure, request_id)
                     else:
                         response = self.controller.handle(value, trusted_human=False)
+                        if value.get("method") != "status" and response.get("outcome") in ("ok", "accepted"):
+                            self.wakeup.set()
                     data = _encode(response, MAX_RESPONSE_BYTES)
                 except TransportError as exc:
                     data = _encode(_error(exc, request_id), MAX_RESPONSE_BYTES)
@@ -387,6 +390,7 @@ class ControllerServer:
 
     def close(self):
         self.stopped.set()
+        self.wakeup.set()
         if self.listener is not None:
             self.listener.close()
             self.listener = None

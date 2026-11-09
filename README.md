@@ -4,7 +4,7 @@ User-level native Herdr mods for browsing any project's Beads issues and opening
 
 ## Install and open
 
-Requires Herdr running locally, `hc`, `bd`, `git`, `omp`, and Python 3 on PATH. Node is only needed for the model regression tests.
+The dashboard/legacy launcher requires Herdr running locally, `hc`, `bd`, `git`, `omp`, and Python 3 on PATH. The independent background service has narrower requirements, documented below. Node is only needed for the model regression tests.
 
 ```sh
 bash ~/.local/share/herdr-beads/install.sh
@@ -12,7 +12,7 @@ cd /path/to/project
 go-bd --dashboard
 ```
 
-The installer copies `beads-dashboard`, `bead-detail`, and `beads-sidebar` into `${HERDR_APP_HOME:-~/.config/herdr-app}/mods`, installs the personal `beads-workspace` layout, and updates `~/.local/bin/go-bd` together with its `go-bd-session.mjs` startup extension and `beads_epics.py` policy module. Keep these three files together. An existing personal layout file is preserved on reinstall. Keep `~/.local/bin` on PATH. `HERDR_APP_HOME` selects a different Herdr window/configuration.
+The installer retains the existing mods, personal layout, and legacy launcher setup, and also provisions the per-user launchd service described below. It copies `beads-dashboard`, `bead-detail`, and `beads-sidebar` into `${HERDR_APP_HOME:-~/.config/herdr-app}/mods`, installs the personal `beads-workspace` layout, and updates `~/.local/bin/go-bd` together with its `go-bd-session.mjs` startup extension and `beads_epics.py` policy module. Keep these three files together. An existing personal layout file is preserved on reinstall. Keep `~/.local/bin` on PATH. `HERDR_APP_HOME` selects a different Herdr window/configuration.
 
 `go-bd --dashboard` opens or focuses the project's Beads tab in its main-checkout space. The dashboard stays pinned to that project when another pane changes directory. Invoking the command from a linked worktree or nested folder resolves the same main checkout and database.
 
@@ -28,6 +28,48 @@ Click **Beads** above Settings in the sidebar. It opens a dashboard tab inside t
 
 Unlike the sidebar button, `go-bd --dashboard` opens the dashboard in the project's main-checkout space. Both views use the same shared project database. Herdr remembers the selected layout across restarts; switching back to `main` restores the shipped interface without removing any tabs or sessions.
 
+
+## Background lifecycle service (macOS)
+
+The single per-user LaunchAgent `com.herdr.beads` starts at login and stays supervised independently of Herdr windows. Installation requires `git`, `bd`, and Python 3 with `venv`/`pip`. The dedicated service venv installs `requirements.txt` (`jsonschema` and `referencing`); the installer records absolute executable paths and never relies on an interactive shell's PATH. Missing optional `gh`, `omp`, `hc`, or `herdr-app` is reported explicitly and does not prevent unrelated bookkeeping. Installing the service does not launch or stop the Herdr app.
+
+Reconciliation runs at startup and every **30 seconds**: a modest idle cadence that notices local ref/history changes and missed events without a busy loop. Validated successful mutating socket requests wake it immediately; `SIGUSR1` and `SIGCONT` also request a fresh pass. After OS resume it reconciles on wake or the next poll. Events are hints, never merge evidence. Pending/uncertain execution cannot block independent merge observation. Unchanged observations refresh service health without accumulating durable operations/audit entries on every tick.
+
+Local-target observation uses the recorded canonical repository/full ref offline, independently of GitHub. Missing provider access holds only its PR/remote-target run; PR evidence is never downgraded to local proof. Missing execution/workspace capabilities refuse launch/resume/focus, not already-submitted Git/Beads bookkeeping. Herdr-unavailable hosting errors stay failures; no synthetic successful launch or alternate harness is supplied. The scheduler neither parses omp internals nor requires an omp process.
+
+Register each canonical main checkout explicitly, including projects with no running session; repeat `--project` for additional projects. Linked-worktree or symlink aliases are refused. Reinstallation merges registrations, preserves the existing machine identity, run store, health file, and logs, and refreshes code and executable paths. It never closes Beads issues or deletes workspaces.
+
+```sh
+bash ~/.local/share/herdr-beads/install.sh install --project /absolute/main-checkout --project "/absolute/another checkout"
+bash ~/.local/share/herdr-beads/install.sh status
+bash ~/.local/share/herdr-beads/install.sh restart
+bash ~/.local/share/herdr-beads/install.sh stop
+# Provision/reinstall without loading, unloading, or querying any live launchd job:
+bash ~/.local/share/herdr-beads/install.sh install --no-start --project /absolute/main-checkout
+```
+
+`stop` unloads only this user's service and retains its configuration/state; `restart` loads it again. Normal install and restart use scoped `launchctl bootout`, `bootstrap`, `kickstart`, and `print` in `gui/$(id -u)`. Failures are nonzero with diagnostics; only bootout's explicit “No such process”/missing-service result is accepted as already stopped. Startup must report service health within ten seconds. `--no-start` makes **no launchctl calls**, even when reinstalling over a currently loaded job.
+
+Defaults:
+
+- Installed Python sources, schemas, and venv: `~/.local/share/herdr-beads-service` (outside repositories).
+- Config: `${XDG_STATE_HOME:-~/.local/state}/herdr-beads/service.json`.
+- Runtime health: the same directory's `service-status.json`; persistent store: `store`; socket: `controller.sock`.
+- Logs: the same directory's `logs/stdout.log` and `logs/stderr.log`.
+- LaunchAgent: `~/Library/LaunchAgents/com.herdr.beads.plist`.
+- Stable existing-or-created machine identity: `${XDG_STATE_HOME:-~/.local/state}/go-bd/machine-id`; an invalid identity is refused, never replaced.
+
+Service/config/store/log directories are owner-only; config, plist, and logs are 0600. The plist contains only explicit `HOME`, `USER`, `LOGNAME`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `HERDR_APP_HOME`, and a bounded executable-directory/system PATH; inherited `BEADS_DIR` and secrets are excluded. `status` prints config, health, log, socket, and store paths, optional capability gaps, launchctl state, and runtime health; launchctl or health errors remain visible and return nonzero. For direct launchd diagnostics:
+
+```sh
+/bin/launchctl print "gui/$(id -u)/com.herdr.beads"
+```
+
+For isolated provisioning, set absolute `HERDR_BEADS_INSTALL_ROOT`, `HERDR_BEADS_STATE_HOME` (the state-home base), and `HERDR_BEADS_LAUNCH_AGENTS`; use the same overrides for subsequent management. These do not create a second label. **Use `--no-start` for isolation:** without it, management still targets the one normal per-user label. `HERDR_BEADS_PYTHON=/absolute/python3` selects the bootstrap interpreter; the venv uses its resolved real interpreter, not a pyenv shim.
+
+The installed package includes the repository's Python adapters and `.mjs` extension files together. Composition is static: only `beads_omp.create_adapters(executables)` may supply execution/workspace adapters, with the service's exact socket bound to the concrete execution adapter. Missing module/factory means unsupported execution capabilities, not a legacy fallback; concrete adapter delivery is `herdr-beads-2hv.3`.
+
+Installed smoke evidence: a disposable real Beads/Git project with no remotes reached the persisted manual handoff with all four optional tools disabled; singleton refusal, canonical-target invalidation, periodic rediscovery, process suspend/resume, SIGKILL/launchd recovery, idempotent reinstall/stop, externally closed/released workspace retention, and read-only sessionless epic progress were exercised. A second installed PR run remained visibly held for missing `gh` while local work progressed. Execution receipts were seeded through the deterministic test adapter; real omp launch and managed-project PR/UI cutover are not inferred. The active user Herdr app was not quit, and machine-wide sleep was not exercised.
 
 ## Dashboard
 
@@ -61,11 +103,11 @@ A live associated Herdr omp session is focused instead of duplicated. Once that 
 
 Epics offer no Start or Resume action. Both direct and Herdr launch entrypoints reject epics before claiming or preparing a session/worktree. Start a concrete child task instead, including planning and investigation work. Existing legacy epic terminals remain focusable in the dashboard; their saved associations are preserved, not resumed or replaced.
 
-`go-bd --reconcile-epics --json` reconciles every epic in the canonical project database and returns progress plus per-epic errors. A nonempty epic closes when all direct children are closed. Reopening a child or adding unfinished work reopens its closed epic; empty epics stay open (previously closed empty epics reopen). Nested epics reconcile bottom-up. Only `closed` children count as complete; sessions, submissions, and merge evidence are not inputs. Normal Beads close gates remain enforced, and a refusal stays visible without blocking other epics.
+`go-bd --reconcile-epics --json` returns read-only direct-child progress and per-epic errors from the canonical project database. Only `closed` children count as complete; actual parent edges determine membership, not dotted IDs. Nonempty all-closed epics report eligibility for **owner review**, but no refresh/service command closes, reopens, retries closure, or changes issue status. Empty epics are not eligible. Nested epic progress uses direct observed child states without inventing transitive closure.
 
-The current dashboard wakes this policy on refresh, nominally every ten seconds while active. This is **not background automation independent of Herdr**: a background-tab smoke did not reconcile until refreshed. The pending controller service must invoke `bin/beads_epics.py`'s `reconcile_epics(project)` on startup and periodic/child-change wakeups, including projects with no execution run.
+Both legacy dashboard refresh and the independent service use `bin/beads_epics.py`'s `observe_epics(project)`. Explicitly registered sessionless projects and projects discovered from durable local runs are observed at startup, periodic passes, and validated-request wakeups. Per-project/per-epic errors remain visible without blocking other projects. This read-only policy supersedes earlier automatic epic-close/reopen behavior under the approved manual-completion scope.
 
-The installed Beads CLI cannot atomically guard the entire nonempty-child predicate. Reconciliation uses unforced `bd close` (not unchecked `bd epic close-eligible`), guarded reopening, and reread/repair. Concurrent child removal/reopening can require another pass; status is eventually convergent, not an instantaneous database invariant.
+Child counts and manual Beads closure are not one atomic transaction. Owners review current child state and normal Beads close gates separately; no force, raw SQL, or background repair bypass is used.
 
 ### Session association
 
@@ -117,16 +159,15 @@ Automatic Bead closure, closure retries, workspace deletion, and destructive reg
 
 ## Durable local controller
 
-The source now includes a version-1 controller, private JSON run store, read-only integration observer, and bounded Unix-socket request CLI. This does **not** replace installed `go-bd`, wire the dashboard/extension, or install launchd. The foreground service deliberately reports unsupported execution capabilities until the concrete omp execution/workspace adapters are supplied by `herdr-beads-2hv.3`; it never falls back to the legacy launcher.
+The version-1 controller includes a private JSON run store, read-only integration observer, bounded Unix-socket request CLI, and installed launchd scheduler. Installation does **not** yet wire the legacy Start/Resume dashboard actions or extension to controller runs; their cutover remains separate. Unavailable concrete omp adapters expose unsupported capabilities without falling back to the legacy launcher.
 
 ```sh
-python3 -m pip install -r requirements.txt
-python3 bin/herdr-beads serve
-# In another terminal: one request on stdin, one response on stdout.
-python3 bin/herdr-beads request < request.json
+# With the launchd service installed/running: one request in, one response out.
+~/.local/share/herdr-beads-service/venv/bin/python \
+  ~/.local/share/herdr-beads-service/bin/herdr-beads request < request.json
 ```
 
-`--socket /absolute/path/controller.sock` selects an isolated socket for either command. Default: `${XDG_STATE_HOME:-~/.local/state}/herdr-beads/controller.sock`. The socket parent must be owner-only (0700); the socket is 0600. The service accepts only local same-user peers on macOS/Linux. Request/response limits are 1 MiB / 4 MiB, with a five-second client deadline. Exit codes: 0 for `ok`/`accepted`, 2 for `refused`, 1 for transport/dependency/IO errors. A timeout/disconnect is **not cancellation**: reuse the same request ID/payload or inspect status before acting.
+`request --socket /absolute/path/controller.sock` selects an isolated socket; default: `${XDG_STATE_HOME:-~/.local/state}/herdr-beads/controller.sock`. The socket parent must be owner-only (0700); the socket is 0600. The service accepts only local same-user peers on macOS/Linux and only versioned, validated run-scoped operations—not arbitrary commands or remote execution. Request/response limits are 1 MiB / 4 MiB, with a five-second client deadline. Exit codes: 0 for `ok`/`accepted`, 2 for `refused`, 1 for transport/dependency/IO errors. A timeout/disconnect is **not cancellation**: reuse the same request ID/payload or inspect status before acting. `bin/herdr-beads serve` is the low-level injectable transport, not the installed periodic scheduler; do not run competing owners on the installed socket.
 
 The controller adopts the existing `go-bd/machine-id`; a missing/invalid identity refuses service startup rather than generating a replacement. Repository identity is the canonical checkout plus Git common directory, independently resolved canonical Beads directory, full issue ID, and machine. Linked worktrees resolve to the canonical source checkout; a clone-backed workspace needs the provider's independent registry/source validation.
 
@@ -176,7 +217,7 @@ Each external step is journaled before execution and its observed receipt commit
 
 ### Concrete adapter seam
 
-`bin/beads_controller.py` exposes `Controller(machine_id, store=None, authority=None, execution=None, workspace=None, integration=None)`, `handle(request, trusted_human=False)`, and `work_once()`. No registry or generic plugin system is involved. The service worker continues independently of request/view lifetime; launchd supervision is separate packaging scope.
+`bin/beads_controller.py` exposes `Controller(machine_id, store=None, authority=None, execution=None, workspace=None, integration=None)`, `handle(request, trusted_human=False)`, `work_once()`, and `reconcile_runs()`. No registry or generic plugin system is involved. The installed launchd worker drains journaled effects and reobserves current runs under the existing worker lock; observation commits require the same run fence and revision, so a concurrent handoff/callback cannot resurrect old proof. Semantic changes are durable; identical polls update health only. Reconciliation retains generic Git path/common-dir/branch validation without requiring omp's provisioning/registry capability, which is still required for execution and never grants cleanup authority.
 
 - Execution declares `capabilities`: `launch`, `exact_resume`, `durable_identity`, `owner_activity`, `structured_handoff`, `explicit_release`, `read_only`. Missing capability/harness returns a structured refusal before unsafe work.
 - Workspace `plan(run)` is read-only and returns the exact schema `Workspace` to journal before allocation; `validate(run)` checks the recorded provider/backing/source/registry identity. Git path/common-dir/branch checks also run in the controller.
@@ -193,7 +234,7 @@ Handoff requires unique immutable submission revisions, all for the explicit tar
 
 `bin/beads_integration.py` performs read-only verification: local source ancestry in a pinned canonical target commit; explicitly trusted rewritten-history mappings independently checked on that target; genuine `gh api` merged/time/repository/base/head/merge-commit evidence for PRs; or explicit `git ls-remote` published-target observation plus already-local objects. It never fetches missing objects or downgrades authority when offline. Provider/auth/network failure holds proof visibly. Local integration is not publication/backup or Beads synchronization.
 
-Verified complete coverage produces read-only access, a journaled adapter-enforcement request, and `closure.state:"awaiting_manual"` with **Merged — awaiting manual closure**. The run contains canonical database/full issue ID, owner/fence, explicit target, exact required submissions and their evidence. `closure.manualCommand` is a safely quoted normal `bd close --reason` command **for owner review only**. Status is timestamped evidence, not a revision-guarded close capability.
+Verified complete coverage produces read-only access, an adapter-enforcement request when supported, and `closure.state:"awaiting_manual"` with **Merged — awaiting manual closure**. The run contains canonical database/full issue ID, owner/fence, explicit target, exact required submissions and their evidence. `closure.manualCommand` is a safely quoted normal `bd close --reason` command **for owner review only**. Service health exposes these identities/evidence alongside timestamped per-run/project errors; the run retains its evidence timestamp when an identical later observation is revalidated. Status is not a revision-guarded close capability.
 
 External manual closure is only `closure.state:"observed_closed"`; the controller does not assert closure ownership or issue/retry a close. Reopen, reassignment, changed submissions and target resets revoke/invalidate old proof rather than reclose. Cleanup stays `held` with `manual_cleanup_required` after integration, closure and release. No workspace, branch, registry, session or terminal cleanup method exists here.
 
@@ -209,7 +250,7 @@ herdr-app check ~/.config/herdr-app/mods/beads-sidebar
 node --test model.test.mjs
 python3 launcher_test.py
 python3 -m unittest epic_test
-python3 -m unittest controller_test store_test transport_test
+python3 -m unittest controller_test store_test transport_test service_test service_install_test
 ```
 
 The native check only covers the initial render. Also open the dashboard in Herdr, switch between All open and Ready, check Ready against the union of `bd ready --limit 0` and `in_progress` issues, and select two issues to confirm detail-pane reuse and formatted Markdown. Check that blocked, in-progress, and deferred issues remain available in All open and closed issues do not appear as matches. For changes to session launching, also exercise a real worktree agent. Session attention states must be observed in the running app, not inferred from an issue's `in_progress` field.

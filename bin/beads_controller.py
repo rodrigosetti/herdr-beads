@@ -447,11 +447,92 @@ class Controller:
             execution.update(state='released', access='read_only', activity='inactive')
         execution['observedAt'] = observation['observedAt']
 
+    def reconcile_runs(self):
+        """Reobserve current runs independently of pending execution effects.
+
+        Reads have no external effect to replay. Commit only semantic changes,
+        fenced against concurrent handoffs/callbacks; unchanged polls update
+        service health rather than accumulating unbounded operation receipts.
+        """
+        def stable(value):
+            if isinstance(value, dict):
+                return {k: stable(v) for k, v in value.items() if k not in ('observedAt', 'evidenceId')}
+            if isinstance(value, list):
+                return [stable(v) for v in value]
+            return value
+
+        def fingerprint(run, receipt, error):
+            return canonical_json(stable({'fence': run['fence'], 'disposition': run['disposition'],
+                'coverageRevision': run['coverage']['revision'], 'coverageState': run['coverage']['state'],
+                'closureState': run['closure']['state'], 'access': run['execution']['access'],
+                'capabilities': self.support()['execution']['supported'], 'receipt': receipt, 'error': error}))
+
+        errors = []
+        try:
+            with self.store.worker_lock():
+                for scope in self.store.documents():
+                    if scope['machineId'] != self.machine_id:
+                        continue
+                    doc = self.store.read(scope)
+                    snapshot = doc['runs'].get(doc['current'])
+                    if not snapshot:
+                        continue
+                    run_id = snapshot['fence']['runId']
+                    private = doc['private'][run_id]
+                    receipt = error = None
+                    try:
+                        self.authority.validate_scope(scope, self.machine_id)
+                        receipt = self.reconcile(copy.deepcopy(snapshot), copy.deepcopy(private))
+                        error = receipt.get('error')
+                    except Refusal as refusal:
+                        error = {'code': refusal.code, 'message': refusal.message}
+                    if error:
+                        errors.append({'scope': copy.deepcopy(scope), **error})
+                    with self.store.transaction(scope) as doc:
+                        run = doc['runs'].get(doc['current'])
+                        if not run or run['fence'] != snapshot['fence'] or run['revision'] != snapshot['revision']:
+                            continue
+                        private = doc['private'][run_id]
+                        if private.get('serviceObservation') == fingerprint(snapshot, receipt, error):
+                            if not error and private.get('serviceError'):
+                                errors.append({'scope': copy.deepcopy(scope), **private['serviceError']})
+                            continue
+                        private['serviceError'] = None
+                        if receipt is None:
+                            self.invalidate(run, doc, error['message'])
+                        else:
+                            try:
+                                self.apply_reconcile(run, receipt, doc)
+                            except Refusal as refusal:
+                                self.invalidate(run, doc, refusal.message)
+                                private['serviceError'] = {'code': refusal.code, 'message': refusal.message}
+                                errors.append({'scope': copy.deepcopy(scope), **private['serviceError']})
+                        private['serviceObservation'] = fingerprint(run, receipt, error)
+                        if (run['execution']['access'] == 'read_only'
+                                and not run['execution']['readOnlyAcknowledged']
+                                and run['release']['state'] != 'released' and run['execution']['session']):
+                            if 'read_only' in self.support()['execution']['supported']:
+                                pending = any(op['public']['fence'] == run['fence']
+                                    and op['public']['state'] in ('pending', 'running')
+                                    and 'read_only' in op['intent']['steps'] for op in doc['operations'].values())
+                                if not pending:
+                                    self.enforce_revocation(doc, run)
+                            elif 'capability_unsupported' not in run['cleanup']['blockers']:
+                                run['cleanup']['blockers'].append('capability_unsupported')
+                        touch(run)
+            return errors
+        except Refusal as error:
+            if error.code == 'pending_operation':
+                return [{'code': error.code, 'message': error.message}]
+            raise
+
     def work_once(self):
         # This retained lock protects external IO, not short request transactions.
         try:
             with self.store.worker_lock():
                 for scope in self.store.documents():
+                    if scope['machineId'] != self.machine_id:
+                        continue
                     doc = self.store.read(scope)
                     for operation_id, operation in doc['operations'].items():
                         if operation['public']['state'] in ('pending', 'running') and self.step(scope, operation_id):
@@ -486,7 +567,7 @@ class Controller:
             self.authority.validate_scope(scope, self.machine_id)
             if step not in ('claim', 'reconcile', 'release', 'read_only'):
                 self.guard_issue(snapshot, writable=step in ('workspace', 'launch') or (step == 'resume' and snapshot['execution']['access'] == 'writable'))
-            if snapshot['workspace']:
+            if snapshot['workspace'] and step != 'reconcile':
                 self.check_workspace(snapshot)
             if step == 'reconcile':
                 receipt = self.reconcile(snapshot, private)
@@ -610,7 +691,12 @@ class Controller:
         if issue.get('assignee') != run['owner'] or issue['status'] not in ('in_progress', 'closed'):
             return result
         if run['coverage']['required']:
-            self.check_workspace(run)
+            # Merge observation needs recorded Git identity, not a live omp
+            # process or workspace provisioning/registry capability. No cleanup
+            # authority is derived from this read-only check.
+            if not run['workspace']:
+                raise Refusal('workspace_missing', 'No recorded submission workspace exists.')
+            validate_workspace(run['workspace'], run['scope'])
             path = run['workspace']['path']
             result['head'] = command(['git', 'rev-parse', 'HEAD'], path)
             result['clean'] = not command(['git', 'status', '--porcelain', '--untracked-files=all'], path)
@@ -629,7 +715,7 @@ class Controller:
         previous = run['issueObservation']
         run['issueObservation'] = copy.deepcopy(issue)
         changed = issue['assignee'] != run['owner'] or issue['status'] not in ('in_progress', 'closed') or (previous and previous['status'] == 'closed' and issue['status'] != 'closed')
-        if changed:
+        if changed and run['disposition'] == 'current':
             run['disposition'] = 'reassigned' if issue['assignee'] != run['owner'] else 'reopened' if previous and previous['status'] == 'closed' else 'cancelled'
             run['fence']['generation'] += 1
             run['execution']['access'] = 'read_only'
