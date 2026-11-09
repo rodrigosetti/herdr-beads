@@ -1,6 +1,6 @@
 import { View, div } from "gpui-kit";
 import { h_flex, v_flex, TextView } from "gpui-base";
-import { exec, nextCommand, props, shared, theme } from "herdr";
+import { exec, nextCommand, props, setShared, shared, theme } from "herdr";
 
 const NARRATIVE = new Set(["description", "design", "acceptance_criteria", "notes", "body", "text", "comment"]);
 const SUMMARY = new Set(["id", "title", "status", "issue_type", "priority"]);
@@ -108,6 +108,9 @@ export default class BeadDetail extends View {
     this.handle = cx.focus_handle();
     this.generation = 0;
     this.context = undefined;
+    this.inputContext = undefined;
+    this.history = [];
+    this.historyIndex = -1;
     this.issue = null;
     this.sections = [];
     this.ready = new Set();
@@ -119,6 +122,9 @@ export default class BeadDetail extends View {
         const command = await nextCommand();
         if (command === "focus") this.handle.focus();
         else if (command === "refresh") this.refresh(cx);
+        else if (command === "back") this.travel(-1, cx);
+        else if (command === "forward") this.travel(1, cx);
+        else if (command.startsWith("select:")) this.navigate(command.slice(7), cx);
         cx.notify();
       }
     });
@@ -126,7 +132,19 @@ export default class BeadDetail extends View {
 
   synchronize(cx) {
     const selected = selection(), key = selectionKey(selected);
+    if (key === this.inputContext) return;
+    this.inputContext = key;
+    this.show(selected, cx);
+  }
+
+  show(selected, cx, record = true) {
+    const key = selectionKey(selected);
     if (key === this.context) return;
+    if (record && selected) {
+      this.history.splice(this.historyIndex + 1);
+      this.history.push(selected);
+      this.historyIndex = this.history.length - 1;
+    }
     this.context = key;
     this.selected = selected;
     this.generation++;
@@ -138,13 +156,34 @@ export default class BeadDetail extends View {
     if (selected) this.refresh(cx);
   }
 
+  publish(selected, cx, record = true) {
+    const key = props()?.selection;
+    if (typeof key === "string") {
+      setShared(key, selected);
+      this.inputContext = selectionKey(selection());
+    }
+    this.show(selected, cx, record);
+    cx.notify();
+  }
+
+  navigate(id, cx) {
+    if (this.selected && typeof id === "string" && id.trim()) this.publish({ ...this.selected, id: id.trim() }, cx);
+  }
+
+  travel(delta, cx) {
+    const index = this.historyIndex + delta;
+    if (index < 0 || index >= this.history.length) return;
+    this.historyIndex = index;
+    this.publish(this.history[index], cx, false);
+  }
+
   refresh(cx) {
-    const selected = selection();
-    if (selectionKey(selected) !== this.context) { this.synchronize(cx); return; }
+    if (selectionKey(selection()) !== this.inputContext) { this.synchronize(cx); return; }
+    const selected = this.selected;
     if (!selected || this.loading) return;
     if (!selected.folder) { this.error = "This issue selection needs a project folder. Open it from a project Beads dashboard or supply folder in the pane props."; return; }
     const generation = ++this.generation, key = this.context;
-    const current = () => this.generation === generation && this.context === key && selectionKey(selection()) === key;
+    const current = () => this.generation === generation && this.context === key && selectionKey(selection()) === this.inputContext;
     this.loading = true;
     this.error = null;
     cx.spawn(async (cx) => {
@@ -201,12 +240,29 @@ export default class BeadDetail extends View {
     return TextView.markdown(`bead-detail-${this.context}-${id}`, text).w_full().min_w(0).flex_none().text_size(13).line_height(1.5).selectable(true).scrollable(false);
   }
 
+  issueLink(id, key, t) {
+    return div().id(`bead-link-${key}-${id}`).text_size(11).text_color(t.accent).cursor_pointer()
+      .tooltip(`Open ${id}`).hover((style) => style.underline())
+      .on_click((_event, cx) => { cx.stop_propagation(); this.navigate(id, cx); }).child(id);
+  }
+
+  historyButton(direction, title, delta, t) {
+    const index = this.historyIndex + delta, enabled = index >= 0 && index < this.history.length;
+    return div().id(`bead-detail-${direction}`).flex_none().px(8).py(5).rounded(6)
+      .text_color(enabled ? t.foreground : t.dim)
+      .tooltip(enabled ? `${title}: ${this.history[index].id}` : title)
+      .when(enabled, (el) => el.cursor_pointer().hover((style) => style.bg(t.hover))
+        .on_click((_event, cx) => { cx.stop_propagation(); this.travel(delta, cx); }))
+      .child(title);
+  }
+
   metadataRow(key, value, t) {
     return h_flex().w_full().min_w(0).flex_none().gap(10).py(3).items_start()
       .child(div().w(105).flex_none().text_size(11).text_color(t.muted).child(label(key)))
       .child(div().flex_1().min_w(0).text_size(12).tooltip(Array.isArray(value) ? value.map(String).join("\n") : String(value))
         .when(key === "spec_id" || key === "external_ref", (el) => el.truncate())
-        .when(key !== "labels", (el) => el.child(readable(key, value)))
+        .when(key === "parent" || key === "parent_id", (el) => el.child(this.issueLink(String(value), key, t)))
+        .when(key !== "labels" && key !== "parent" && key !== "parent_id", (el) => el.child(readable(key, value)))
         .when(key === "labels", (el) => el.child(h_flex().min_w(0).gap(5).flex_wrap()
           .children((Array.isArray(value) ? value : [value]).map((item) => this.badge(String(item), t.muted, t))))));
   }
@@ -248,13 +304,14 @@ export default class BeadDetail extends View {
   relationships(key, value, t) {
     if (!Array.isArray(value)) return this.markdown(key, field(key, value));
     return v_flex().w_full().min_w(0).flex_none().gap(10).children(value.map((issue, index) => {
-      if (!issue || typeof issue !== "object" || Array.isArray(issue)) return this.markdown(`${key}-${index}`, typeof issue === "string" ? escape(issue) : jsonBlock(issue));
+      if (typeof issue === "string") return this.issueLink(issue, `${key}-${index}`, t);
+      if (!issue || typeof issue !== "object" || Array.isArray(issue)) return this.markdown(`${key}-${index}`, jsonBlock(issue));
       const ready = this.ready.has(issue.id);
       const entries = Object.entries(issue).filter(([key, value]) => !SUMMARY.has(key) && nonempty(value));
       const metadata = entries.filter(([key, value]) => simple(value) && !NARRATIVE.has(key));
       const content = entries.filter(([key, value]) => !simple(value) || NARRATIVE.has(key));
       return v_flex().w_full().min_w(0).flex_none().p(12).gap(8).rounded(7).bg(t.surface).border(1).border_color(t.border)
-        .when(nonempty(issue.id), (el) => el.child(div().text_size(11).text_color(t.accent).child(String(issue.id))))
+        .when(nonempty(issue.id), (el) => el.child(this.issueLink(String(issue.id), `${key}-${index}`, t)))
         .when(nonempty(issue.title), (el) => el.child(div().font_semibold().text_size(13).child(String(issue.title))))
         .child(h_flex().min_w(0).gap(6).flex_wrap()
           .when(ready || nonempty(issue.status), (el) => el.child(this.badge(ready ? "Ready" : readable("status", issue.status), ready ? t.ansi2 : issue.status === "closed" ? t.dim : t.muted, t)
@@ -287,6 +344,8 @@ export default class BeadDetail extends View {
       })
       .child(h_flex().flex_none().h(44).px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().font_semibold().child("Bead details"))
+        .child(this.historyButton("back", "← Back", -1, t))
+        .child(this.historyButton("forward", "Forward →", 1, t))
         .child(div().flex_1())
         .child(div().id("bead-detail-refresh").flex_none().px(9).py(5).rounded(6).text_color(selected && !this.loading ? t.foreground : t.dim)
           .when(Boolean(selected && !this.loading), (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)))

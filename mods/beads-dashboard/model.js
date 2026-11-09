@@ -1,7 +1,7 @@
 const priority = (issue) => Number.isFinite(issue.priority) ? issue.priority : 5;
 const compare = (a, b) => priority(a) - priority(b) || a.id.localeCompare(b.id);
 
-export function issueRows(issues, ready, { mode = "all", folded = new Set(), epics = [] } = {}) {
+export function issueRows(issues, ready, { mode = "all", folded = new Set(), reveal = null, epics = [] } = {}) {
   const byId = new Map(issues.map((issue) => [issue.id, issue]));
   const childProgress = new Map(epics.map((epic) => [epic.id, { completed: epic.closed_children, total: epic.total_children }]));
   const open = issues.filter((issue) => !issue.context && issue.status !== "closed");
@@ -9,7 +9,9 @@ export function issueRows(issues, ready, { mode = "all", folded = new Set(), epi
   const matches = mode === "ready" ? readyIssues : open;
   const matched = new Set(matches.map((issue) => issue.id));
   const included = new Set(matched);
-  for (const issue of matches) {
+  const target = byId.get(reveal);
+  if (target) included.add(target.id);
+  for (const issue of target ? [...matches, target] : matches) {
     let parent = issue.parent;
     const seen = new Set([issue.id]);
     while (parent && byId.has(parent) && !seen.has(parent)) {
