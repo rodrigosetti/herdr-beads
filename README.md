@@ -84,7 +84,7 @@ Both direct and Herdr launches load the explicit startup extension. It obtains t
 - `machine`: a local identity stored in `${XDG_STATE_HOME:-~/.local/state}/go-bd/machine-id`.
 - `worktree`: the original absolute worktree directory.
 
-The metadata update merges only this key and preserves other metadata. A fresh task is delivered only after the transcript and metadata are saved; Herdr success also requires the startup acknowledgement. Primary-session switches/forks update the association; subagent sessions do not replace it.
+The extension publishes the durable transcript binding to the controller; its execution adapter owns the field-preserving `metadata.omp_session` mirror. A fresh task and launcher acknowledgement require the controller's exact-session acknowledgement after validation and metadata publication. The extension makes no Beads mutations. Subagents cannot replace the primary association. Switch, fork/branch, and tree navigation are explicitly refused while mapped: they require a new controller binding, not an implicit conversation replacement.
 
 Resume uses `omp --resume <session_file>` with no new startup task and no `--restore`: it reopens the conversation and waits for input rather than automatically restarting interrupted work. The original transcript ID, machine, directory, repository, and worktree branch are checked. Missing transcripts/worktrees, malformed records, foreign-machine records, or conflicting session ownership fail explicitly rather than starting fresh. Recorded history on a non-`in_progress` issue is not automatically replaced or resumed.
 
@@ -117,7 +117,7 @@ Automatic Bead closure, closure retries, workspace deletion, and destructive reg
 
 ## Durable local controller
 
-The source now includes a version-1 controller, private JSON run store, read-only integration observer, and bounded Unix-socket request CLI. This does **not** replace installed `go-bd`, wire the dashboard/extension, or install launchd. The foreground service deliberately reports unsupported execution capabilities until the concrete omp execution/workspace adapters are supplied by `herdr-beads-2hv.3`; it never falls back to the legacy launcher.
+The source includes a version-1 controller, private JSON run store, read-only integration observer, bounded Unix-socket request CLI, and controller-connected omp startup extension. This does **not** cut over the installed legacy launcher/dashboard or install launchd. The foreground service reports unsupported execution capabilities until the concrete execution/workspace adapters are supplied by `herdr-beads-2hv.3`; it never falls back to the legacy launcher.
 
 ```sh
 python3 -m pip install -r requirements.txt
@@ -185,6 +185,66 @@ Each external step is journaled before execution and its observed receipt commit
 - `validate_observation(run, observation, private)` independently verifies actual durable session/terminal/workspace/ownership and acknowledgements. JSON shape or callback credential alone is insufficient proof. The controller validates fence, binding, event ID and monotonic sequence; secrets/transcript paths never appear in public run/operation responses.
 - Omp transcript/lease/process recognition, initial task delivery after durable acknowledgement, exact resume arguments, and field-preserving `metadata.omp_session` mirroring remain exclusively adapter/adoption responsibilities. This controller never rewrites Beads metadata, so unrelated keys remain untouched.
 
+### Omp session extension
+
+`bin/go-bd-session.mjs` is owned, implemented, and packaged by **herdr-beads**, not omp-core. `install.sh` copies this file beside the launcher at `~/.local/bin/go-bd-session.mjs`; the concrete omp adapter loads it explicitly with `omp --extension /absolute/path/go-bd-session.mjs`. Its supported API baseline is [omp 18.17.0](https://github.com/can1357/oh-my-pi/blob/v18.17.0/docs/extensions.md): `ensureOnDisk`, `FileSessionStorage` leases, main/sub identity, lifecycle hooks, managed timers, async-job snapshots, and registered commands. There is no ambient discovery, second harness, or universal harness claim.
+
+This extension requires controller-v1 launch configuration. Do not deploy it with the old direct-mutation launcher: missing configuration or acknowledgement visibly terminates the session before startup work. Launcher/service installation and coordinated cutover are separate tasks (`herdr-beads-2hv.3`, `herdr-beads-2hv.5`, `herdr-beads-rlm.4`); no legacy protocol fallback is provided.
+
+`GO_BD_SESSION_CONFIG` names an absolute, owner-only JSON file in an owner-only directory outside the workspace. The adapter supplies:
+
+- `schemaVersion:1`, canonical `scope`, exact `fence`, private `bindingId`/`credential`, and absolute `controllerSocket`.
+- Canonical `worktree`, `previous` (exact prior `omp_session` or null), absolute startup `ack`, optional `prompt_file`, and `access` (`writable` or `read_only`).
+- Neutral `terminal:{machineId,address,spaceId,tabId}`. If null, only actual `HC_TERMINAL_ID` supplies the local address; absent identity refuses startup.
+
+The extension claims the writer's session lease before `ensureOnDisk`, then validates the actual transcript header/ID/canonical directory. It atomically writes and fsyncs `<config>.binding.json` before sending a fenced, credentialed, monotonically sequenced `observe`. This private record carries the neutral `binding`, omp transcript identity, PID, latest `observation`, sequence, access/frozen/released gates, and `acknowledged` flag. The controller execution adapter independently validates it and publishes/verifies the field-preserving metadata mirror before acknowledging; a callback secret alone is not ownership proof. Only then does the extension mark acknowledged and publish the immutable `session_bound` observation in `ack.observation`. It never invokes `bd` or independently competes to update the association.
+Each serialized action shares one 25-second controller acknowledgement budget across its requests, below omp's 30-second lifecycle-handler limit. Slow publication may exceed the transport CLI's five-second client deadline; this extension connects directly and waits within its action budget. A missing, refused, or late acknowledgement still fences/exits visibly without dispatching the startup task. No retry creates another request, event, or session identity.
+
+The main session receives Bead/database/run context before each prompt. Commands:
+
+| Command | Contract |
+|---|---|
+| `/bead-context` | Current same-fence controller state and ownership policy; no mutation |
+| `/bead-handoff <JSON>` | Full `HandoffParams` from `schemas/v1/controller.schema.json`, **without** `expected`; the extension obtains the current same-fence revision |
+| `/bead-release <reason>` | Explicit owner relinquishment request, refused while streaming, queued input, running async work, pending delivery, or unknown job ownership exists |
+
+For example, a local handoff has this shape (replace identities and SHAs with real values; the controller checks actual workspace HEAD/history):
+
+```json
+{
+  "previousCoverageRevision": 0,
+  "target": {
+    "mode": "local-target",
+    "repository": {"root": "/canonical/repo", "commonDir": "/canonical/repo/.git"},
+    "ref": "refs/heads/main"
+  },
+  "workspaceHead": "0123456789abcdef0123456789abcdef01234567",
+  "requiredSubmissions": [{
+    "submissionId": "review-1",
+    "submissionRevision": 1,
+    "head": "0123456789abcdef0123456789abcdef01234567",
+    "target": {
+      "mode": "local-target",
+      "repository": {"root": "/canonical/repo", "commonDir": "/canonical/repo/.git"},
+      "ref": "refs/heads/main"
+    },
+    "pullRequest": null
+  }],
+  "summary": "Ready for owner review",
+  "nextSteps": ["Owner integrates into the recorded target"],
+  "risks": []
+}
+```
+
+Local-target needs no remote, GitHub metadata, network, or credentials. For `github-pr`, both targets instead bind `repository:{host,repositoryId,owner,name}` and the full expected base `ref`; each submission must include exact `pullRequest:{number,url}` and submitted `head`. Mode/target/coverage changes are explicit, never inferred from a Git remote. No command merges code or attests integration; rewritten local history requires a separate trusted operator receipt, independently verified on the target.
+
+The controller adapter writes `<config>.control.json` with `{fence,bindingId,requestId,command:"read_only"|"release"}`. Managed polling reads only this private control channel, never merge status. Read-only enforcement freezes new tool calls, aborts the turn, and acknowledges only once owned work is inactive. Release requires a preceding controller owner request, rechecks idle state after IO, and durably freezes the primary/subagent tool gate before emitting `release_acknowledged`. A failed/ambiguous request stays fenced for inspection; it never silently reopens writable authority. Resources and the lease remain retained until process shutdown.
+
+Idle/`agent_end` only reports turn attention while ownership remains active. `session_stop`, shutdown, and timers are not merge or release evidence. Shutdown skips a busy owner queue and otherwise spends at most 500 ms awaiting its exit notification; it releases the local lease without waiting for merge, issuing release, closing Beads, or deleting anything. The durable binding remains available for independent process/lease reconciliation after a missed notification.
+
+Observed extension validation: actual omp 18.17.0 TUI context/handoff/release commands against an isolated local protocol peer, actual persistent transcript/lease handling, and delayed startup with a six-second acknowledgement before the launcher receipt. Earlier real metadata-mirror validation preceded its transfer to the controller execution adapter. This is adapter-surface evidence, not production-controller/Herdr cutover or genuine managed-PR merge acceptance.
+
+
 ### Integration evidence and manual owner handoff
 
 Targets are explicit: `local-target` binds canonical repository/full `refs/heads/...`; `github-pr` additionally binds host/stable repository ID/owner/name, PR number/URL, expected base and exact submitted head; explicit `remote-target` retains remote authority. Remote presence does not select a mode. Local mode requires no remote, provider fields, credentials or network.
@@ -206,7 +266,7 @@ cd ~/.local/share/herdr-beads
 herdr-app check ~/.config/herdr-app/mods/beads-dashboard
 herdr-app check ~/.config/herdr-app/mods/bead-detail
 herdr-app check ~/.config/herdr-app/mods/beads-sidebar
-node --test model.test.mjs
+node --test model.test.mjs session.test.mjs
 python3 launcher_test.py
 python3 -m unittest epic_test
 python3 -m unittest controller_test store_test transport_test

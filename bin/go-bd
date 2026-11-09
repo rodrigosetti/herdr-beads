@@ -424,7 +424,9 @@ def prompt(project, issue_id):
     return (
         f"Bead {issue_id} is claimed and in progress. Start working on it.\n"
         f"Use the shared Beads database at {project.beads} (BEADS_DIR is set).\n"
-        "Do not automatically close this issue, remove this worktree, or push.\n\n"
+        "Agents do not close Beads, delete workspaces, merge, or push. The trusted controller "
+        "records lifecycle transitions only after independent verification. Closure and cleanup "
+        "remain separate owner-reviewed manual actions; handoff, idle, and release are not merge evidence.\n\n"
         + details
     )
 
