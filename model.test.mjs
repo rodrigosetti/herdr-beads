@@ -107,6 +107,25 @@ test("folding ready-filter context hides descendants without changing ready coun
   assert.deepEqual(unfolded.rows.map(({ issue }) => issue.id), ["epic", "child", "grandchild", "sibling"]);
 });
 
+test("navigation reveals filtered or closed targets and ancestors without changing filter counts", () => {
+  const data = [
+    issue("epic", 0),
+    issue("ready", 1, "epic"),
+    issue("blocked", 2, "epic", { status: "blocked" }),
+    issue("closed", 3, "epic", { status: "closed", context: true }),
+  ];
+  for (const reveal of ["blocked", "closed"]) {
+    const result = issueRows(data, new Set(["ready"]), { mode: "ready", reveal });
+    assert.deepEqual(result.rows.map(({ issue, depth, context }) => [issue.id, depth, context]), [
+      ["epic", 0, true], ["ready", 1, false], [reveal, 1, true],
+    ]);
+    assert.equal(result.count, 1);
+    assert.deepEqual(result.counts, { all: 3, ready: 1 });
+    assert.deepEqual(issueRows(data, new Set(["ready"]), { mode: "ready" }).rows.map(({ issue }) => issue.id), ["epic", "ready"]);
+  }
+  assert.deepEqual(issueRows(data, new Set(), { reveal: "missing" }).rows.map(({ issue }) => issue.id), ["epic", "ready", "blocked"]);
+});
+
 test("closed ancestors can provide context and parent cycles cannot hide work", () => {
   const data = [issue("closed", 0, null, { status: "closed", context: true }), issue("child", 1, "closed"), issue("a", 2, "b"), issue("b", 3, "a")];
   const result = issueRows(data, new Set());

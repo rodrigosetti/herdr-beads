@@ -1,6 +1,6 @@
 import { View, div } from "gpui-kit";
-import { v_flex, h_flex } from "gpui-base";
-import { agents, exec, focused, nextCommand, panes, props, run, setShared, spaces, terminals, theme } from "herdr";
+import { v_flex, h_flex, v_virtual_list, VirtualListScrollHandle, Scrollbar } from "gpui-base";
+import { agents, exec, focused, nextCommand, panes, props, run, setShared, shared, spaces, terminals, theme } from "herdr";
 import { issueAction, issueRows, issueSessions, sessionLabels, statusLabels } from "./model.js";
 
 function preferences(key) {
@@ -31,6 +31,9 @@ export default class BeadsDashboard extends View {
     this.loading = false;
     this.loaded = false;
     this.starting = new Set();
+    this.navigationIssues = [];
+    this.navigationGeneration = 0;
+    this.scroll = VirtualListScrollHandle.new();
     this.handle = cx.focus_handle();
     this.refresh(cx);
     cx.timer.every(10000, (cx) => this.refresh(cx));
@@ -85,6 +88,7 @@ export default class BeadsDashboard extends View {
           for (const parent of parents) byId.set(parent.id, { ...parent, context: true });
         }
         this.issues = [...byId.values()];
+        if (this.selected && !byId.has(this.selected) && !this.navigationIssues.some((issue) => issue.id === this.selected)) this.observedSelection = null;
         this.blocked = new Set(blocked.map((issue) => issue.id));
         for (const issue of issues) if (issue.status === "blocked") this.blocked.add(issue.id);
         this.ready = new Set(ready.map((issue) => issue.id));
@@ -116,8 +120,43 @@ export default class BeadsDashboard extends View {
       ?? all.find((pane) => pane.mod === "beads-dashboard" && pane.focused);
   }
 
+  synchronize(cx) {
+    if (!this.project || !this.tab) return;
+    const value = shared(`beads.selection.${this.tab}`);
+    if (!value || value.beads !== this.project.beads || (value.machine ?? null) !== this.machine || !value.id || value.id === this.observedSelection) return;
+    this.observedSelection = value.id;
+    this.selected = value.id;
+    this.revealPending = value.id;
+    this.navigationIssues = [];
+    const generation = ++this.navigationGeneration;
+    if (this.issues.some((issue) => issue.id === value.id)) return;
+    cx.spawn(async (cx) => {
+      try {
+        const found = await this.bd(["show", `--id=${value.id}`, "--brief-deps"]);
+        if (!found.some((issue) => issue.id === value.id)) throw new Error(`bd show did not return issue ${value.id}.`);
+        const byId = new Map(this.issues.map((issue) => [issue.id, issue]));
+        for (const issue of found) byId.set(issue.id, { ...issue, context: true });
+        const fetched = new Set();
+        for (;;) {
+          const missing = [...new Set([...byId.values()].map((issue) => issue.parent).filter((id) => id && !byId.has(id) && !fetched.has(id)))];
+          if (!missing.length) break;
+          missing.forEach((id) => fetched.add(id));
+          for (const issue of await this.bd(["show", ...missing, "--brief-deps"])) byId.set(issue.id, { ...issue, context: true });
+        }
+        if (generation !== this.navigationGeneration) return;
+        this.navigationIssues = [...byId.values()].filter((issue) => issue.context);
+      } catch (error) {
+        if (generation === this.navigationGeneration) this.error = String(error.message ?? error);
+      } finally { cx.notify(); }
+    });
+  }
+
+  close() {
+    this.scroll.release();
+  }
+
   select(id, cx) {
-    if (!this.project || !this.issues.some((issue) => issue.id === id)) return;
+    if (!this.project || ![...this.issues, ...this.navigationIssues].some((issue) => issue.id === id)) return;
     const dashboard = this.ownPane();
     if (!dashboard) { this.error = "Dashboard pane not found. Open it as a tab with go-bd --dashboard."; cx.notify(); return; }
     this.tab = dashboard.tab;
@@ -191,12 +230,12 @@ export default class BeadsDashboard extends View {
       .child(div().flex_none().text_color(ready ? t.ansi2 : issue.status === "in_progress" ? t.working : t.muted)
         .child(ready ? "Ready" : statusLabels[issue.status] ?? issue.status))
       .when(blocked, (element) => element.child(div().text_color(t.blocked).child("Dependency blocked")))
-      .when(context, (element) => element.child(div().child("Group context")));
+      .when(context, (element) => element.child(div().child(this.selected === issue.id ? "Navigation context" : "Group context")));
     const action = decision === "focus" ? this.button(`go-${issue.id}`, "Go to session", () => this.focusSession(session), t)
       : busy ? div().flex_none().text_size(12).text_color(t.muted).frames(decision === "resume" ? ["Resuming", "Resuming ·", "Resuming ··"] : ["Starting", "Starting ·", "Starting ··"], 300)
       : decision ? this.button(`start-${issue.id}`, decision === "resume" ? "Resume" : "Start", (cx) => this.launch(issue.id, cx), t)
       : div().flex_none().w(58);
-    return h_flex().id(`bead-${issue.id}`).flex_none().min_h(68).pl(10 + Math.min(depth, 8) * 18).pr(12).py(10).gap(8).items_center()
+    return h_flex().id(`bead-${issue.id}`).flex_none().h(68).pl(10 + Math.min(depth, 8) * 18).pr(12).py(10).gap(8).items_center()
       .border_b(1).border_color(t.border).cursor_pointer().bg(this.selected === issue.id ? t.selected : issue.issue_type === "epic" ? t.surface : t.background)
       .hover((style) => style.bg(t.hover)).on_click((_event, cx) => this.select(issue.id, cx))
       .child(fold)
@@ -210,8 +249,23 @@ export default class BeadsDashboard extends View {
   }
 
   render(cx) {
+    this.synchronize(cx);
     const t = theme(), sessions = this.sessionMap();
-    const { rows, count, counts } = issueRows(this.issues, this.ready, { mode: this.mode, folded: this.folded });
+    const known = new Set(this.issues.map((issue) => issue.id));
+    const issues = [...this.issues, ...this.navigationIssues.filter((issue) => !known.has(issue.id))];
+    if (this.revealPending && issues.some((issue) => issue.id === this.revealPending)) {
+      const byId = new Map(issues.map((issue) => [issue.id, issue])), seen = new Set();
+      let parent = byId.get(this.revealPending)?.parent;
+      while (parent && !seen.has(parent)) {
+        seen.add(parent);
+        this.folded.delete(parent);
+        parent = byId.get(parent)?.parent;
+      }
+      this.save();
+    }
+    const { rows, count, counts } = issueRows(issues, this.ready, { mode: this.mode, folded: this.folded, reveal: this.selected });
+    const index = this.revealPending ? rows.findIndex((row) => row.issue.id === this.revealPending) : -1;
+    if (index >= 0) { this.scroll.scroll_to_item(index, "center"); this.revealPending = null; }
     const name = this.project?.folder.replace(/[\\/]$/, "").split(/[\\/]/).pop() || "Project";
     return v_flex().id("beads-dashboard").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(13)
       .track_focus(this.handle).on_mouse_down("left", () => this.handle.focus())
@@ -227,7 +281,12 @@ export default class BeadsDashboard extends View {
         .child(div().text_size(11).text_color(t.muted).child(this.loaded ? `${count} ${count === 1 ? "issue" : "issues"} · ${sessions.size} with live ${sessions.size === 1 ? "session" : "sessions"}` : "Loading project…")))
       .when(!!this.error, (element) => element.child(div().flex_none().px(16).py(10).bg(t.surface).text_color(t.blocked).child(`${this.error}${this.loaded ? " — showing last successful refresh" : ""}`)))
       .when(!!this.notice, (element) => element.child(div().flex_none().px(16).py(8).text_size(12).text_color(t.done).child(this.notice)))
-      .child(v_flex().id("beads-list").flex_1().min_h(0).overflow_y_scrollbar().children(rows.map((row) => this.row(row, sessions, t)))
+      .child(v_flex().flex_1().min_h(0).relative()
+        .when(rows.length > 0, (element) => element
+          .child(v_virtual_list("beads-list", rows.length, 68, (index) => rows[index].issue.id,
+            (range) => rows.slice(range.start, range.end).map((row) => this.row(row, sessions, t)))
+            .size_full().track_scroll(this.scroll))
+          .child(Scrollbar.vertical("beads-list").absolute().inset_0()))
         .when(!rows.length, (element) => element.child(v_flex().p(24).gap(8)
           .child(div().text_color(t.muted).child(!this.loaded ? this.loading ? "Loading beads…" : "Could not load this project." : this.mode === "ready" ? "No ready or in-progress issues." : "No open issues.")))))
       .child(h_flex().flex_none().px(16).py(8).gap(12).border_t(1).border_color(t.border).text_size(10.5).text_color(t.dim)
