@@ -193,11 +193,19 @@ Handoff requires unique immutable submission revisions, all for the explicit tar
 
 `bin/beads_integration.py` performs read-only verification: local source ancestry in a pinned canonical target commit; explicitly trusted rewritten-history mappings independently checked on that target; genuine `gh api` merged/time/repository/base/head/merge-commit evidence for PRs; or explicit `git ls-remote` published-target observation plus already-local objects. It never fetches missing objects or downgrades authority when offline. Provider/auth/network failure holds proof visibly. Local integration is not publication/backup or Beads synchronization.
 
+Local proof reads the exact canonical Git common directory and a direct full branch ref, pins its commit, checks source (or receipt-result) ancestry, then rereads the authority before returning evidence. Clone-local branches, symbolic target redirects, replacement refs and grafts cannot supply proof. Git reads disable implicit promisor-object fetches. Missing objects hold verification. Remote-target proof rereads the explicitly recorded published ref; tracking refs, remote aliases and URL rewrites are not authority.
+
+GitHub uses an explicit uncached GET for the recorded host/repository/PR, verifies stable repository identity and web/API URLs, and requires `state=closed`, boolean `merged=true`, a valid nonfuture merge time and exact submitted head. The provider result commit proves merge, squash and rebase equally; source ancestry is not required. Deleted fork repositories are supported. HTTP responses with missing/old/future Date (60-second clock tolerance), nonzero Age, cache-hit/stale indicators or ambiguous records hold proof rather than reuse it. Local clock skew can therefore require correction before PR verification succeeds. PR bodies never select a Bead or authorize completion.
+
+After provider observation, reconciliation resamples workspace HEAD/cleanliness and Beads ownership/status before preparing the handoff. Each reconciliation replaces consumable evidence; reset targets, failed lookups, new unsubmitted commits and changed ownership invalidate the displayed command. Evidence is a timestamped observation, not an atomic lock on Git/GitHub/Beads; the owner must review it before acting.
+
 Verified complete coverage produces read-only access, a journaled adapter-enforcement request, and `closure.state:"awaiting_manual"` with **Merged — awaiting manual closure**. The run contains canonical database/full issue ID, owner/fence, explicit target, exact required submissions and their evidence. `closure.manualCommand` is a safely quoted normal `bd close --reason` command **for owner review only**. Status is timestamped evidence, not a revision-guarded close capability.
 
 External manual closure is only `closure.state:"observed_closed"`; the controller does not assert closure ownership or issue/retry a close. Reopen, reassignment, changed submissions and target resets revoke/invalidate old proof rather than reclose. Cleanup stays `held` with `manual_cleanup_required` after integration, closure and release. No workspace, branch, registry, session or terminal cleanup method exists here.
 
 Observed validation: deterministic recovery/concurrency/refusal tests, actual socket/CLI accepted-operation smoke with a deliberately delayed deterministic execution boundary, real offline local fast-forward proof, and genuine read-only GitHub PR evidence ([cli/cli#8294](https://github.com/cli/cli/pull/8294)) surviving store reopen. The latter is observer verification, **not** managed-project PR/cutover acceptance. Real omp/session resume and combined local/PR/UI acceptance belong to the concrete adapter and cutover tasks; they are not inferred from these storage/transport checks.
+
+Additional observer acceptance exercised real offline normal/fast-forward merges and exact local squash receipts (including reset invalidation), plus genuine provider records for [merge](https://github.com/kubernetes/kubernetes/pull/143983), [squash](https://github.com/python/cpython/pull/161674) and [rebase](https://github.com/zulip/zulip/pull/40635). These are independent adapter observations, not a claim that this project's run was merged or that managed-project/UI cutover passed.
 
 ## Verification
 
@@ -209,7 +217,7 @@ herdr-app check ~/.config/herdr-app/mods/beads-sidebar
 node --test model.test.mjs
 python3 launcher_test.py
 python3 -m unittest epic_test
-python3 -m unittest controller_test store_test transport_test
+python3 -m unittest integration_local_test integration_pr_test controller_test store_test transport_test
 ```
 
 The native check only covers the initial render. Also open the dashboard in Herdr, switch between All open and Ready, check Ready against the union of `bd ready --limit 0` and `in_progress` issues, and select two issues to confirm detail-pane reuse and formatted Markdown. Check that blocked, in-progress, and deferred issues remain available in All open and closed issues do not appear as matches. For changes to session launching, also exercise a real worktree agent. Session attention states must be observed in the running app, not inferred from an issue's `in_progress` field.
