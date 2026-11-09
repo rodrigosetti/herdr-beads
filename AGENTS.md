@@ -2,6 +2,13 @@
 
 This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
 
+## Worktree-Only Development
+
+- All repository changes, including code, tests, documentation, and agent instructions, MUST be made and committed on a non-`main` branch in a dedicated linked Git worktree.
+- NEVER edit repository files or create development commits directly in the main checkout or on `main`.
+- Before editing, check `git branch --show-current` and `git worktree list`. If you are in the main checkout or on `main`, create or switch to a dedicated worktree first.
+- `main` is an integration target only: merge completed work into it only when explicitly authorized. A request to commit does not authorize working directly on `main`.
+
 > **Architecture in one line:** Issues live in a local Dolt database
 > (`.beads/dolt/`); cross-machine sync uses `bd dolt push/pull` (a
 > git-compatible protocol), stored under `refs/dolt/data` on your git
