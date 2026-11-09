@@ -435,7 +435,13 @@ def main(argv=None):
         else:
             from beads_controller import Controller
             from beads_identity import machine_id
-            ControllerServer(Controller(machine_id()), path).serve_forever()
+            from beads_identity import Authority
+            from beads_omp import OmpExecution
+            from beads_workspace import OmpWorkspace
+            authority = Authority()
+            execution = OmpExecution(authority=authority, socket_path=path or default_socket_path())
+            ControllerServer(Controller(machine_id(), authority=authority, execution=execution,
+                                        workspace=OmpWorkspace()), path).serve_forever()
             return 0
     except KeyboardInterrupt:
         return 0 if args.command == "serve" else 1

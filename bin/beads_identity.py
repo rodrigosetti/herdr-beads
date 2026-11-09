@@ -75,7 +75,7 @@ class Authority:
     def bd(self, scope, *args):
         env = os.environ.copy()
         env['BEADS_DIR'] = scope['beadsDir']
-        text = command(['bd', '--sandbox', *args, '--json'], scope['repository']['root'], env=env)
+        text = command(['bd', '--sandbox', *args, '--json'], scope['repository']['root'], env=env, timeout=20)
         try:
             return json.loads(text)
         except ValueError as error:
@@ -96,7 +96,7 @@ class Authority:
         root = scope['repository']['root']
         if (Path(root) / '.beads').is_dir():
             env['BEADS_DIR'] = str(Path(root) / '.beads')
-        location = json.loads(command(['bd', '--sandbox', 'where', '--json'], root, env=env))
+        location = json.loads(command(['bd', '--sandbox', 'where', '--json'], root, env=env, timeout=20))
         if str(Path(location['path']).resolve()) != scope['beadsDir']:
             raise Refusal('database_mismatch', 'Requested database is not the canonical repository database.')
         context = self.bd(scope, 'context')

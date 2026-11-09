@@ -117,7 +117,7 @@ Automatic Bead closure, closure retries, workspace deletion, and destructive reg
 
 ## Durable local controller
 
-The source now includes a version-1 controller, private JSON run store, read-only integration observer, and bounded Unix-socket request CLI. This does **not** replace installed `go-bd`, wire the dashboard/extension, or install launchd. The foreground service deliberately reports unsupported execution capabilities until the concrete omp execution/workspace adapters are supplied by `herdr-beads-2hv.3`; it never falls back to the legacy launcher.
+The source includes a version-1 controller, private JSON run store, concrete omp execution/workspace adapters, read-only integration observer, and bounded Unix-socket request CLI. Foreground `serve` composes these adapters; this does **not** replace installed `go-bd`, wire the dashboard, migrate legacy runs, or install launchd. Those cutovers remain separately owned. Only omp is supported; missing tools or capabilities refuse rather than substituting a harness.
 
 ```sh
 python3 -m pip install -r requirements.txt
@@ -182,8 +182,17 @@ Each external step is journaled before execution and its observed receipt commit
 - Workspace `plan(run)` is read-only and returns the exact schema `Workspace` to journal before allocation; `validate(run)` checks the recorded provider/backing/source/registry identity. Git path/common-dir/branch checks also run in the controller.
 - Execution/workspace implement `perform(step, run, intent, private)` and read-only `recover(...)`. Steps are `workspace`, `launch`, `resume`, `focus`, `release`, `read_only`; Beads claim is the controller authority's own step. `intent` supplies the operation ID, fence and journal position; private state supplies the planned workspace, scoped binding/credential, sequence, and adapter-owned association.
 - A receipt is `{"workspace": Workspace}` or `{"observation": Observation}` as appropriate; focus completes only after the adapter verifies/focuses the exact live owner. Unknown outcomes return null. Optional `receipt.private` merges into the adapter-owned private association, including when a matching callback raced its receipt.
-- `validate_observation(run, observation, private)` independently verifies actual durable session/terminal/workspace/ownership and acknowledgements. JSON shape or callback credential alone is insufficient proof. The controller validates fence, binding, event ID and monotonic sequence; secrets/transcript paths never appear in public run/operation responses.
-- Omp transcript/lease/process recognition, initial task delivery after durable acknowledgement, exact resume arguments, and field-preserving `metadata.omp_session` mirroring remain exclusively adapter/adoption responsibilities. This controller never rewrites Beads metadata, so unrelated keys remain untouched.
+- `validate_observation(run, observation, private)` independently verifies actual durable session/terminal/workspace/ownership and acknowledgements without effects. Optional `publish_observation(...)` runs only after policy accepts the validated event, before acknowledging the request; the omp adapter uses it for field-preserving canonical session mirroring. JSON shape or callback credential alone is insufficient proof. The controller validates fence, binding, event ID and monotonic sequence; secrets/transcript paths never appear in public run/operation responses.
+- Omp transcript/lease/process recognition, initial task delivery after durable acknowledgement, exact resume arguments, and field-preserving `metadata.omp_session` mirroring remain exclusively adapter/adoption responsibilities. General controller policy never interprets or rewrites omp metadata.
+
+`bin/beads_omp.py:OmpExecution`, `bin/beads_workspace.py:OmpWorkspace`, and `bin/beads_herdr.py:HerdrHosting` are separate concrete dependencies, not a plugin framework. `create_adapters(executables)` supplies static service composition with explicit absolute executable paths; null tools never fall back to ambient PATH. Launch, exact resume, durable identity, owner activity and structured handoff are supported. Read-only enforcement and explicit release remain visibly unsupported by this adapter until the extension-control integration is installed.
+
+Before terminal creation, the adapter fsyncs an owner-only per-run/generation startup config and initial task outside the workspace under `${XDG_STATE_HOME:-~/.local/state}/herdr-beads/omp`. An interrupted or slow Herdr request reconnects by the exact `GO_BD_SESSION_CONFIG` value in the terminal's immutable creation argv, including the creation-to-labeling gap. Recovery never issues another terminal creation request. Unconfirmed operations retain their claims, workspace, transcript and terminal for inspection.
+
+Start/focus/resume recheck the canonical database, owner, blockers and workspace identity. Focus requires the acknowledged foreground omp PID and exact transcript lease, not a title or stale agent report. Ended terminals resume only the recorded absolute transcript with `--resume`, no fresh task or `--restore`; missing, foreign, conflicting or leased history refuses intact. Existing legacy associations require explicit adoption rather than a new-run overwrite.
+
+Workspace planning preserves the explicit integration target and branches new work from its already-local ref; no remote, fetch, push, PR creation or merge is required for local-target mode. Registry/source/common-dir/branch checks distinguish independent clones from linked workspaces; clone origin never selects the integration destination. Omp 18.17's copy-on-write “clone” provisioning still registers linked Git worktrees. Supported config queries can initialize omp settings storage, and `omp worktree add` runs the user's existing checkout hooks; the adapter itself issues no network or integration commands.
+
 
 ### Integration evidence and manual owner handoff
 
@@ -197,7 +206,9 @@ Verified complete coverage produces read-only access, a journaled adapter-enforc
 
 External manual closure is only `closure.state:"observed_closed"`; the controller does not assert closure ownership or issue/retry a close. Reopen, reassignment, changed submissions and target resets revoke/invalidate old proof rather than reclose. Cleanup stays `held` with `manual_cleanup_required` after integration, closure and release. No workspace, branch, registry, session or terminal cleanup method exists here.
 
-Observed validation: deterministic recovery/concurrency/refusal tests, actual socket/CLI accepted-operation smoke with a deliberately delayed deterministic execution boundary, real offline local fast-forward proof, and genuine read-only GitHub PR evidence ([cli/cli#8294](https://github.com/cli/cli/pull/8294)) surviving store reopen. The latter is observer verification, **not** managed-project PR/cutover acceptance. Real omp/session resume and combined local/PR/UI acceptance belong to the concrete adapter and cutover tasks; they are not inferred from these storage/transport checks.
+Observed validation includes deterministic recovery/concurrency/refusal tests, actual socket/CLI delayed-operation recovery, offline local fast-forward proof, and genuine read-only GitHub PR evidence ([cli/cli#8294](https://github.com/cli/cli/pull/8294)) surviving store reopen. The latter remains observer verification, **not** managed-project PR/cutover acceptance.
+
+Concrete adapter smoke (2026-11-09, omp 18.17): actual Herdr start → focus → killed-terminal exact resume retained workspaces, transcript IDs, token recall and unrelated metadata for both a no-remote `local-target` (`refs/heads/integration-local`) and an explicitly configured `github-pr` target (`cli/cli`, stable repository ID `212613049`, `refs/heads/trunk`). The socket service was reopened without losing either run. A focus exceeding the client deadline reconnected to the same succeeded operation. This proves execution/target retention, not creation/merge of a managed PR or installed dashboard/extension cutover.
 
 ## Verification
 
@@ -209,7 +220,7 @@ herdr-app check ~/.config/herdr-app/mods/beads-sidebar
 node --test model.test.mjs
 python3 launcher_test.py
 python3 -m unittest epic_test
-python3 -m unittest controller_test store_test transport_test
+python3 -m unittest discover -p '*_test.py'
 ```
 
 The native check only covers the initial render. Also open the dashboard in Herdr, switch between All open and Ready, check Ready against the union of `bd ready --limit 0` and `in_progress` issues, and select two issues to confirm detail-pane reuse and formatted Markdown. Check that blocked, in-progress, and deferred issues remain available in All open and closed issues do not appear as matches. For changes to session launching, also exercise a real worktree agent. Session attention states must be observed in the running app, not inferred from an issue's `in_progress` field.
