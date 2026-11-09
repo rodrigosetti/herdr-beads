@@ -2,6 +2,13 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
+## Worktree-Only Development
+
+- All repository changes, including code, tests, documentation, and agent instructions, MUST be made and committed on a non-`main` branch in a dedicated linked Git worktree.
+- NEVER edit repository files or create development commits directly in the main checkout or on `main`.
+- Before editing, check `git branch --show-current` and `git worktree list`. If you are in the main checkout or on `main`, create or switch to a dedicated worktree first.
+- `main` is an integration target only: merge completed work into it only when explicitly authorized. A request to commit does not authorize working directly on `main`.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:1105d646 -->
 ## Beads Issue Tracker
 
