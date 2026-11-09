@@ -109,11 +109,95 @@ Per-project launch locks and terminal/dashboard receipts live under `${XDG_STATE
 
 ### Manual completion policy
 
-The approved lifecycle delivery verifies integration and prepares an evidence-backed owner handoff: **Merged — awaiting manual closure**. Both offline local-target and GitHub PR verification remain required. This policy change does not install that workflow; controller, verification, handoff, and UI implementation remain tracked in `herdr-beads-2hv`, `herdr-beads-8vu`, and `herdr-beads-rlm`. The existing launcher does not verify merges or generate closure handoffs.
+The lifecycle controller below verifies integration and prepares an evidence-backed owner handoff: **Merged — awaiting manual closure**. Both offline local-target and GitHub PR verification remain required. Installed dashboard/launcher cutover and the concrete omp adapter remain tracked separately in `herdr-beads-2hv`, `herdr-beads-8vu`, and `herdr-beads-rlm`; the existing launcher does not verify merges or generate closure handoffs.
 
 The owner reviews the current canonical database, full issue ID, ownership/run/submission, target, and merge evidence, then separately executes normal `bd close --reason …` without `--force`. Manual closure retains Beads' existing concurrency limitations: it is not atomically guarded against reopen, reassignment, or a newer run. A Herdr lock or a preceding status check does not remove that race. Observing an externally closed issue is not proof that a particular run owned its closure.
 
 Automatic Bead closure, closure retries, workspace deletion, and destructive registry/terminal cleanup remain disabled, including after manual closure or explicit session release. Workspaces and transcripts stay intact for separate operator review and manual cleanup. The lifecycle delivery must keep retained resources inspectable after their Bead closes. Guarded automation is optional backlog (`herdr-beads-6yd`), not a release prerequisite; no upstream Beads patch or database topology change is required for the manual-completion scope.
+
+## Durable local controller
+
+The source now includes a version-1 controller, private JSON run store, read-only integration observer, and bounded Unix-socket request CLI. This does **not** replace installed `go-bd`, wire the dashboard/extension, or install launchd. The foreground service deliberately reports unsupported execution capabilities until the concrete omp execution/workspace adapters are supplied by `herdr-beads-2hv.3`; it never falls back to the legacy launcher.
+
+```sh
+python3 -m pip install -r requirements.txt
+python3 bin/herdr-beads serve
+# In another terminal: one request on stdin, one response on stdout.
+python3 bin/herdr-beads request < request.json
+```
+
+`--socket /absolute/path/controller.sock` selects an isolated socket for either command. Default: `${XDG_STATE_HOME:-~/.local/state}/herdr-beads/controller.sock`. The socket parent must be owner-only (0700); the socket is 0600. The service accepts only local same-user peers on macOS/Linux. Request/response limits are 1 MiB / 4 MiB, with a five-second client deadline. Exit codes: 0 for `ok`/`accepted`, 2 for `refused`, 1 for transport/dependency/IO errors. A timeout/disconnect is **not cancellation**: reuse the same request ID/payload or inspect status before acting.
+
+The controller adopts the existing `go-bd/machine-id`; a missing/invalid identity refuses service startup rather than generating a replacement. Repository identity is the canonical checkout plus Git common directory, independently resolved canonical Beads directory, full issue ID, and machine. Linked worktrees resolve to the canonical source checkout; a clone-backed workspace needs the provider's independent registry/source validation.
+
+### Versioned requests and independent state
+
+The complete wire shapes live in `schemas/v1/{controller,run,adapter}.schema.json`. Every request has `apiVersion:1`, a unique `requestId`, canonical `scope`, `method`, and typed `params`. For example, status has no mutation precondition:
+
+```json
+{
+  "apiVersion": 1,
+  "requestId": "owner-status-1",
+  "method": "status",
+  "scope": {
+    "repository": {"root": "/canonical/repo", "commonDir": "/canonical/repo/.git"},
+    "beadsDir": "/canonical/repo/.beads",
+    "issueId": "project-full-id",
+    "machineId": "existing-go-bd-machine-id"
+  },
+  "params": {"runId": null}
+}
+```
+
+Mutations carry `expected:{fence:{runId,attempt,generation},revision}`; only the first `start_or_focus` uses `expected:null`. Start additionally declares `harness:"omp"`, an explicit target, `newAttempt:false`, and `policy:{closeAfterIntegration:false,cleanupAfterRelease:false}`. Either policy set to true is refused. No request enables closure, push, fetch, merge, or resource deletion.
+
+| Method | Effect |
+|---|---|
+| `status` | Current or retained run, latest durable operation, supported capabilities and action refusals; saved observations are timestamped, not a fresh authority check |
+| `start_or_focus` | Reserve one eligible attempt, focus a validated live owner, or exact-resume an inactive writable session; no fallback conversation |
+| `resume` | Exact saved conversation, new generation/binding; explicit read-only access requires current integration and adapter enforcement |
+| `handoff` | Immutable source revisions, complete required set, exact workspace HEAD, summary/next steps/risks; neither release nor merge |
+| `reconcile` | Fresh Beads/workspace/target/provider observations for the fenced run; invalidates unavailable/stale proof |
+| `confirm_integration` | Trusted local owner receipt for rewritten local history; never agent prose or a callback assertion |
+| `release` | Explicit original-owner relinquishment plus validated adapter acknowledgement, including revoked/failed reservations; retains resources |
+| `observe` | Scoped credential/binding/sequence and adapter-validated neutral session/activity/release observations |
+
+The socket always passes `trusted_human=False`: `confirm_integration` is refused with `untrusted_receipt` over this transport. An explicitly owner-authorized local embedding may call `Controller.handle(request, trusted_human=True)` after human review; JSON flags cannot enable that authority. A receipt alone does not prove integration: the observer independently verifies its exact resulting commit on the recorded target.
+
+Execution/activity/access, required submission coverage, observed Beads closure, owner release, and cleanup are independent. Idle, turn-end, exit, lease expiry, branch disappearance and manual closure never imply release. A revoked incarnation cannot regain writable authority; its original owner can still explicitly release it. A new attempt requires prior acknowledged release and a distinct workspace plan. Historical attempts remain inspectable.
+
+### Storage, serialization and recovery
+
+`bin/beads_store.py` stores one versioned document per SHA-256 of canonical repository/database/full issue identity under `${XDG_STATE_HOME:-~/.local/state}/herdr-beads/store`. Machine identity is validated inside the document, not used to hide foreign-machine conflicts. The current pointer, retained runs, request deduplication, operation intents/receipts, private bindings and audit history commit in one atomic replacement. State must remain outside repositories/workspaces. Files are 0600 and the store directory 0700; symlink/foreign/malformed/version-mismatched records are refused intact, never reset or quarantined.
+
+Writes fsync the same-directory temporary file, atomically replace the snapshot, then fsync the directory. Permanent same-inode scope locks serialize requests; a separate permanent worker lock serializes external effects without holding the request lock across slow IO. Lock contention defers work rather than stopping the service. Same `(scope,requestId)` plus identical payload resolves to its original operation/result; a different payload refuses `request_id_conflict`. Completed results are historical receipts, not fresh authorization; consult current status/reconcile before owner action.
+
+Each external step is journaled before execution and its observed receipt committed afterward. On restart an already-started step calls read-only `recover`, **never `perform` again**. An unknown outcome remains visibly pending with its operation ID; it cannot duplicate a worker or overwrite another attempt. A failed attempt retains claims/resources/history for review. The store keeps only a timestamped Beads status/assignee observation, not an authoritative issue copy. General transitions neither parse transcripts/process names nor read/write `metadata.omp_session`.
+
+### Concrete adapter seam
+
+`bin/beads_controller.py` exposes `Controller(machine_id, store=None, authority=None, execution=None, workspace=None, integration=None)`, `handle(request, trusted_human=False)`, and `work_once()`. No registry or generic plugin system is involved. The service worker continues independently of request/view lifetime; launchd supervision is separate packaging scope.
+
+- Execution declares `capabilities`: `launch`, `exact_resume`, `durable_identity`, `owner_activity`, `structured_handoff`, `explicit_release`, `read_only`. Missing capability/harness returns a structured refusal before unsafe work.
+- Workspace `plan(run)` is read-only and returns the exact schema `Workspace` to journal before allocation; `validate(run)` checks the recorded provider/backing/source/registry identity. Git path/common-dir/branch checks also run in the controller.
+- Execution/workspace implement `perform(step, run, intent, private)` and read-only `recover(...)`. Steps are `workspace`, `launch`, `resume`, `focus`, `release`, `read_only`; Beads claim is the controller authority's own step. `intent` supplies the operation ID, fence and journal position; private state supplies the planned workspace, scoped binding/credential, sequence, and adapter-owned association.
+- A receipt is `{"workspace": Workspace}` or `{"observation": Observation}` as appropriate; focus completes only after the adapter verifies/focuses the exact live owner. Unknown outcomes return null. Optional `receipt.private` merges into the adapter-owned private association, including when a matching callback raced its receipt.
+- `validate_observation(run, observation, private)` independently verifies actual durable session/terminal/workspace/ownership and acknowledgements. JSON shape or callback credential alone is insufficient proof. The controller validates fence, binding, event ID and monotonic sequence; secrets/transcript paths never appear in public run/operation responses.
+- Omp transcript/lease/process recognition, initial task delivery after durable acknowledgement, exact resume arguments, and field-preserving `metadata.omp_session` mirroring remain exclusively adapter/adoption responsibilities. This controller never rewrites Beads metadata, so unrelated keys remain untouched.
+
+### Integration evidence and manual owner handoff
+
+Targets are explicit: `local-target` binds canonical repository/full `refs/heads/...`; `github-pr` additionally binds host/stable repository ID/owner/name, PR number/URL, expected base and exact submitted head; explicit `remote-target` retains remote authority. Remote presence does not select a mode. Local mode requires no remote, provider fields, credentials or network.
+
+Handoff requires unique immutable submission revisions, all for the explicit target. Required sources must exist in workspace history and the required set must include the exact workspace HEAD (supports stacked/multiple submissions without silently omitting newer work). A changed mode/target/head/required set invalidates aggregate proof and preserves prior evidence in audit. Every required member needs fresh current-fence evidence; one merged PR does not complete another submission.
+
+`bin/beads_integration.py` performs read-only verification: local source ancestry in a pinned canonical target commit; explicitly trusted rewritten-history mappings independently checked on that target; genuine `gh api` merged/time/repository/base/head/merge-commit evidence for PRs; or explicit `git ls-remote` published-target observation plus already-local objects. It never fetches missing objects or downgrades authority when offline. Provider/auth/network failure holds proof visibly. Local integration is not publication/backup or Beads synchronization.
+
+Verified complete coverage produces read-only access, a journaled adapter-enforcement request, and `closure.state:"awaiting_manual"` with **Merged — awaiting manual closure**. The run contains canonical database/full issue ID, owner/fence, explicit target, exact required submissions and their evidence. `closure.manualCommand` is a safely quoted normal `bd close --reason` command **for owner review only**. Status is timestamped evidence, not a revision-guarded close capability.
+
+External manual closure is only `closure.state:"observed_closed"`; the controller does not assert closure ownership or issue/retry a close. Reopen, reassignment, changed submissions and target resets revoke/invalidate old proof rather than reclose. Cleanup stays `held` with `manual_cleanup_required` after integration, closure and release. No workspace, branch, registry, session or terminal cleanup method exists here.
+
+Observed validation: deterministic recovery/concurrency/refusal tests, actual socket/CLI accepted-operation smoke with a deliberately delayed deterministic execution boundary, real offline local fast-forward proof, and genuine read-only GitHub PR evidence ([cli/cli#8294](https://github.com/cli/cli/pull/8294)) surviving store reopen. The latter is observer verification, **not** managed-project PR/cutover acceptance. Real omp/session resume and combined local/PR/UI acceptance belong to the concrete adapter and cutover tasks; they are not inferred from these storage/transport checks.
 
 ## Verification
 
@@ -125,6 +209,7 @@ herdr-app check ~/.config/herdr-app/mods/beads-sidebar
 node --test model.test.mjs
 python3 launcher_test.py
 python3 -m unittest epic_test
+python3 -m unittest controller_test store_test transport_test
 ```
 
 The native check only covers the initial render. Also open the dashboard in Herdr, switch between All open and Ready, check Ready against the union of `bd ready --limit 0` and `in_progress` issues, and select two issues to confirm detail-pane reuse and formatted Markdown. Check that blocked, in-progress, and deferred issues remain available in All open and closed issues do not appear as matches. For changes to session launching, also exercise a real worktree agent. Session attention states must be observed in the running app, not inferred from an issue's `in_progress` field.

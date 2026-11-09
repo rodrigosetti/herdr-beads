@@ -1,0 +1,917 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr-beads.local/schemas/v1/controller.schema.json",
+  "title": "Bead-run v1 shared UI, extension and service request/response contract",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/Request"
+    },
+    {
+      "$ref": "#/$defs/Response"
+    }
+  ],
+  "$defs": {
+    "Selector": {
+      "$ref": "run.schema.json#/$defs/Scope"
+    },
+    "StartParams": {
+      "type": "object",
+      "properties": {
+        "expected": {
+          "anyOf": [
+            {
+              "$ref": "run.schema.json#/$defs/Precondition"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "harness": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target": {
+          "$ref": "run.schema.json#/$defs/Target"
+        },
+        "policy": {
+          "$ref": "run.schema.json#/$defs/Policy"
+        },
+        "newAttempt": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "expected",
+        "harness",
+        "target",
+        "policy",
+        "newAttempt"
+      ],
+      "additionalProperties": false
+    },
+    "ResumeParams": {
+      "type": "object",
+      "properties": {
+        "expected": {
+          "$ref": "run.schema.json#/$defs/Precondition"
+        },
+        "access": {
+          "enum": [
+            "writable",
+            "read_only"
+          ]
+        }
+      },
+      "required": [
+        "expected",
+        "access"
+      ],
+      "additionalProperties": false
+    },
+    "HandoffParams": {
+      "type": "object",
+      "properties": {
+        "expected": {
+          "$ref": "run.schema.json#/$defs/Precondition"
+        },
+        "previousCoverageRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "target": {
+          "$ref": "run.schema.json#/$defs/Target"
+        },
+        "workspaceHead": {
+          "type": "string",
+          "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+        },
+        "requiredSubmissions": {
+          "type": "array",
+          "items": {
+            "$ref": "run.schema.json#/$defs/SubmissionIdentity"
+          },
+          "minItems": 1
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "nextSteps": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "risks": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "required": [
+        "expected",
+        "previousCoverageRevision",
+        "target",
+        "workspaceHead",
+        "requiredSubmissions",
+        "summary",
+        "nextSteps",
+        "risks"
+      ],
+      "additionalProperties": false
+    },
+    "ReleaseParams": {
+      "type": "object",
+      "properties": {
+        "expected": {
+          "$ref": "run.schema.json#/$defs/Precondition"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "expected",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "StatusParams": {
+      "type": "object",
+      "properties": {
+        "runId": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "runId"
+      ],
+      "additionalProperties": false
+    },
+    "ReconcileParams": {
+      "type": "object",
+      "properties": {
+        "expected": {
+          "$ref": "run.schema.json#/$defs/Precondition"
+        }
+      },
+      "required": [
+        "expected"
+      ],
+      "additionalProperties": false
+    },
+    "ReceiptParams": {
+      "type": "object",
+      "properties": {
+        "expected": {
+          "$ref": "run.schema.json#/$defs/Precondition"
+        },
+        "receipt": {
+          "$ref": "run.schema.json#/$defs/IntegrationReceipt"
+        }
+      },
+      "required": [
+        "expected",
+        "receipt"
+      ],
+      "additionalProperties": false
+    },
+    "ObserveParams": {
+      "type": "object",
+      "properties": {
+        "credential": {
+          "type": "string",
+          "minLength": 1
+        },
+        "observation": {
+          "$ref": "adapter.schema.json#/$defs/Observation"
+        }
+      },
+      "required": [
+        "credential",
+        "observation"
+      ],
+      "additionalProperties": false
+    },
+    "Method": {
+      "enum": [
+        "start_or_focus",
+        "resume",
+        "handoff",
+        "release",
+        "status",
+        "reconcile",
+        "confirm_integration",
+        "observe"
+      ]
+    },
+    "Request": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "apiVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "method": {
+              "const": "start_or_focus"
+            },
+            "scope": {
+              "$ref": "#/$defs/Selector"
+            },
+            "params": {
+              "$ref": "#/$defs/StartParams"
+            }
+          },
+          "required": [
+            "apiVersion",
+            "requestId",
+            "method",
+            "scope",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "apiVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "method": {
+              "const": "resume"
+            },
+            "scope": {
+              "$ref": "#/$defs/Selector"
+            },
+            "params": {
+              "$ref": "#/$defs/ResumeParams"
+            }
+          },
+          "required": [
+            "apiVersion",
+            "requestId",
+            "method",
+            "scope",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "apiVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "method": {
+              "const": "handoff"
+            },
+            "scope": {
+              "$ref": "#/$defs/Selector"
+            },
+            "params": {
+              "$ref": "#/$defs/HandoffParams"
+            }
+          },
+          "required": [
+            "apiVersion",
+            "requestId",
+            "method",
+            "scope",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "apiVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "method": {
+              "const": "release"
+            },
+            "scope": {
+              "$ref": "#/$defs/Selector"
+            },
+            "params": {
+              "$ref": "#/$defs/ReleaseParams"
+            }
+          },
+          "required": [
+            "apiVersion",
+            "requestId",
+            "method",
+            "scope",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "apiVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "method": {
+              "const": "status"
+            },
+            "scope": {
+              "$ref": "#/$defs/Selector"
+            },
+            "params": {
+              "$ref": "#/$defs/StatusParams"
+            }
+          },
+          "required": [
+            "apiVersion",
+            "requestId",
+            "method",
+            "scope",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "apiVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "method": {
+              "const": "reconcile"
+            },
+            "scope": {
+              "$ref": "#/$defs/Selector"
+            },
+            "params": {
+              "$ref": "#/$defs/ReconcileParams"
+            }
+          },
+          "required": [
+            "apiVersion",
+            "requestId",
+            "method",
+            "scope",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "apiVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "method": {
+              "const": "confirm_integration"
+            },
+            "scope": {
+              "$ref": "#/$defs/Selector"
+            },
+            "params": {
+              "$ref": "#/$defs/ReceiptParams"
+            }
+          },
+          "required": [
+            "apiVersion",
+            "requestId",
+            "method",
+            "scope",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "apiVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "method": {
+              "const": "observe"
+            },
+            "scope": {
+              "$ref": "#/$defs/Selector"
+            },
+            "params": {
+              "$ref": "#/$defs/ObserveParams"
+            }
+          },
+          "required": [
+            "apiVersion",
+            "requestId",
+            "method",
+            "scope",
+            "params"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "RefusalCode": {
+      "enum": [
+        "unsupported_version",
+        "invalid_request",
+        "unsupported_harness",
+        "unsupported_capability",
+        "unknown_machine",
+        "remote_machine",
+        "repository_mismatch",
+        "database_mismatch",
+        "workspace_mismatch",
+        "workspace_missing",
+        "session_missing",
+        "session_mismatch",
+        "session_owned",
+        "terminal_mismatch",
+        "ambiguous_identity",
+        "owner_mismatch",
+        "issue_not_ready",
+        "issue_blocked",
+        "issue_changed",
+        "issue_closed",
+        "issue_cancelled",
+        "stale_attempt",
+        "stale_generation",
+        "stale_revision",
+        "run_released",
+        "run_read_only",
+        "pending_operation",
+        "submission_changed",
+        "target_changed",
+        "coverage_incomplete",
+        "integration_needs_confirmation",
+        "evidence_unavailable",
+        "evidence_invalid",
+        "cleanup_held",
+        "guarded_closure_unavailable",
+        "request_id_conflict",
+        "untrusted_receipt",
+        "invalid_record"
+      ]
+    },
+    "Operation": {
+      "type": "object",
+      "properties": {
+        "operationId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "method": {
+          "$ref": "#/$defs/Method"
+        },
+        "fence": {
+          "$ref": "run.schema.json#/$defs/Fence"
+        },
+        "state": {
+          "enum": [
+            "pending",
+            "running",
+            "succeeded",
+            "failed"
+          ]
+        },
+        "phase": {
+          "enum": [
+            "reserved",
+            "workspace",
+            "launch",
+            "awaiting_ack",
+            "binding",
+            "mirroring",
+            "verifying",
+            "releasing",
+            "inspecting",
+            "complete"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "message": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "code",
+                "message"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "operationId",
+        "requestId",
+        "method",
+        "fence",
+        "state",
+        "phase",
+        "createdAt",
+        "updatedAt",
+        "error"
+      ],
+      "additionalProperties": false
+    },
+    "Action": {
+      "type": "object",
+      "properties": {
+        "method": {
+          "$ref": "#/$defs/Method"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "refusal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RefusalCode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "method",
+        "enabled",
+        "refusal"
+      ],
+      "additionalProperties": false
+    },
+    "Support": {
+      "type": "object",
+      "properties": {
+        "harnesses": {
+          "const": [
+            "omp"
+          ]
+        },
+        "execution": {
+          "$ref": "adapter.schema.json#/$defs/Capabilities"
+        },
+        "workspaceProvider": {
+          "const": "omp-worktree"
+        },
+        "integrationModes": {
+          "const": [
+            "local-target",
+            "github-pr",
+            "remote-target"
+          ]
+        }
+      },
+      "required": [
+        "harnesses",
+        "execution",
+        "workspaceProvider",
+        "integrationModes"
+      ],
+      "additionalProperties": false
+    },
+    "Success": {
+      "type": "object",
+      "properties": {
+        "apiVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "outcome": {
+          "const": "ok"
+        },
+        "action": {
+          "enum": [
+            "status",
+            "focused",
+            "started",
+            "resumed",
+            "handoff_recorded",
+            "release_requested",
+            "reconciled",
+            "receipt_recorded",
+            "observation_recorded",
+            "duplicate"
+          ]
+        },
+        "run": {
+          "anyOf": [
+            {
+              "$ref": "run.schema.json#/$defs/Run"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Operation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Action"
+          }
+        },
+        "support": {
+          "$ref": "#/$defs/Support"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "requestId",
+        "outcome",
+        "action",
+        "run",
+        "operation",
+        "actions",
+        "support"
+      ],
+      "additionalProperties": false
+    },
+    "Accepted": {
+      "type": "object",
+      "properties": {
+        "apiVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "outcome": {
+          "const": "accepted"
+        },
+        "operation": {
+          "$ref": "#/$defs/Operation"
+        },
+        "run": {
+          "$ref": "run.schema.json#/$defs/Run"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "requestId",
+        "outcome",
+        "operation",
+        "run"
+      ],
+      "additionalProperties": false
+    },
+    "Refused": {
+      "type": "object",
+      "properties": {
+        "apiVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "outcome": {
+          "const": "refused"
+        },
+        "error": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/RefusalCode"
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1
+            },
+            "retryable": {
+              "type": "boolean"
+            },
+            "capability": {
+              "anyOf": [
+                {
+                  "$ref": "adapter.schema.json#/$defs/Capability"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "retryable",
+            "capability"
+          ],
+          "additionalProperties": false
+        },
+        "run": {
+          "anyOf": [
+            {
+              "$ref": "run.schema.json#/$defs/Run"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Operation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "apiVersion",
+        "requestId",
+        "outcome",
+        "error",
+        "run",
+        "operation"
+      ],
+      "additionalProperties": false
+    },
+    "Error": {
+      "type": "object",
+      "properties": {
+        "apiVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "outcome": {
+          "const": "error"
+        },
+        "error": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "enum": [
+                "io_error",
+                "dependency_failed",
+                "timeout",
+                "service_unavailable"
+              ]
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1
+            },
+            "retryable": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "retryable"
+          ],
+          "additionalProperties": false
+        },
+        "run": {
+          "anyOf": [
+            {
+              "$ref": "run.schema.json#/$defs/Run"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Operation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "apiVersion",
+        "requestId",
+        "outcome",
+        "error",
+        "run",
+        "operation"
+      ],
+      "additionalProperties": false
+    },
+    "Response": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Success"
+        },
+        {
+          "$ref": "#/$defs/Accepted"
+        },
+        {
+          "$ref": "#/$defs/Refused"
+        },
+        {
+          "$ref": "#/$defs/Error"
+        }
+      ]
+    }
+  }
+}

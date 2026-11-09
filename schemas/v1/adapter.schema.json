@@ -1,0 +1,464 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr-beads.local/schemas/v1/adapter.schema.json",
+  "title": "Bead-run v1 internal execution and workspace boundary",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/Capabilities"
+    },
+    {
+      "$ref": "#/$defs/LaunchContext"
+    },
+    {
+      "$ref": "#/$defs/OmpBinding"
+    },
+    {
+      "$ref": "#/$defs/Observation"
+    },
+    {
+      "$ref": "#/$defs/WorkspaceInspection"
+    }
+  ],
+  "$defs": {
+    "Capability": {
+      "enum": [
+        "launch",
+        "exact_resume",
+        "durable_identity",
+        "owner_activity",
+        "structured_handoff",
+        "explicit_release",
+        "read_only"
+      ]
+    },
+    "Capabilities": {
+      "type": "object",
+      "properties": {
+        "harness": {
+          "const": "omp"
+        },
+        "supported": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Capability"
+          },
+          "uniqueItems": true
+        },
+        "unsupported": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Capability"
+          },
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "harness",
+        "supported",
+        "unsupported"
+      ],
+      "additionalProperties": false
+    },
+    "LaunchContext": {
+      "type": "object",
+      "properties": {
+        "fence": {
+          "$ref": "run.schema.json#/$defs/Fence"
+        },
+        "scope": {
+          "$ref": "run.schema.json#/$defs/Scope"
+        },
+        "workspace": {
+          "$ref": "run.schema.json#/$defs/Workspace"
+        },
+        "bindingId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "access": {
+          "enum": [
+            "writable",
+            "read_only"
+          ]
+        },
+        "callbackCredential": {
+          "type": "string",
+          "minLength": 1
+        },
+        "initialTask": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resumeSession": {
+          "anyOf": [
+            {
+              "$ref": "run.schema.json#/$defs/Session"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "fence",
+        "scope",
+        "workspace",
+        "bindingId",
+        "access",
+        "callbackCredential",
+        "initialTask",
+        "resumeSession"
+      ],
+      "additionalProperties": false
+    },
+    "OmpBinding": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "fence": {
+          "$ref": "run.schema.json#/$defs/Fence"
+        },
+        "binding": {
+          "$ref": "run.schema.json#/$defs/Session"
+        },
+        "machineId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspacePath": {
+          "type": "string",
+          "pattern": "^/[^\\u0000]*$"
+        },
+        "omp": {
+          "type": "object",
+          "properties": {
+            "session_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "session_file": {
+              "type": "string",
+              "pattern": "^/[^\\u0000]*$"
+            },
+            "machine": {
+              "type": "string",
+              "minLength": 1
+            },
+            "worktree": {
+              "type": "string",
+              "pattern": "^/[^\\u0000]*$"
+            }
+          },
+          "required": [
+            "session_id",
+            "session_file",
+            "machine",
+            "worktree"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "fence",
+        "binding",
+        "machineId",
+        "workspacePath",
+        "omp"
+      ],
+      "additionalProperties": false
+    },
+    "LegacyOmpSession": {
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "session_file": {
+          "type": "string",
+          "pattern": "^/[^\\u0000]*$"
+        },
+        "machine": {
+          "type": "string",
+          "minLength": 1
+        },
+        "worktree": {
+          "type": "string",
+          "pattern": "^/[^\\u0000]*$"
+        }
+      },
+      "required": [
+        "session_id",
+        "session_file",
+        "machine",
+        "worktree"
+      ],
+      "additionalProperties": false
+    },
+    "BoundEvent": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "session_bound"
+        },
+        "session": {
+          "$ref": "run.schema.json#/$defs/Session"
+        },
+        "terminal": {
+          "anyOf": [
+            {
+              "$ref": "run.schema.json#/$defs/Terminal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "activity": {
+          "enum": [
+            "active",
+            "inactive"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "session",
+        "terminal",
+        "activity"
+      ],
+      "additionalProperties": false
+    },
+    "ActivityEvent": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "activity"
+        },
+        "activity": {
+          "enum": [
+            "active",
+            "inactive",
+            "unknown"
+          ]
+        },
+        "turn": {
+          "enum": [
+            "working",
+            "idle",
+            "needs_attention",
+            "done_unseen"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "activity",
+        "turn"
+      ],
+      "additionalProperties": false
+    },
+    "ExitEvent": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "exited"
+        },
+        "exitCode": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "activity": {
+          "enum": [
+            "inactive",
+            "unknown"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "exitCode",
+        "activity"
+      ],
+      "additionalProperties": false
+    },
+    "ReadOnlyEvent": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "read_only_acknowledged"
+        },
+        "session": {
+          "$ref": "run.schema.json#/$defs/Session"
+        }
+      },
+      "required": [
+        "kind",
+        "session"
+      ],
+      "additionalProperties": false
+    },
+    "ReleaseEvent": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "release_acknowledged"
+        },
+        "receipt": {
+          "$ref": "run.schema.json#/$defs/ReleaseReceipt"
+        }
+      },
+      "required": [
+        "kind",
+        "receipt"
+      ],
+      "additionalProperties": false
+    },
+    "SessionChangeEvent": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "primary_session_changed"
+        },
+        "previousSession": {
+          "$ref": "run.schema.json#/$defs/Session"
+        },
+        "session": {
+          "$ref": "run.schema.json#/$defs/Session"
+        }
+      },
+      "required": [
+        "kind",
+        "previousSession",
+        "session"
+      ],
+      "additionalProperties": false
+    },
+    "Observation": {
+      "type": "object",
+      "properties": {
+        "fence": {
+          "$ref": "run.schema.json#/$defs/Fence"
+        },
+        "bindingId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "eventId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "observedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "event": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/BoundEvent"
+            },
+            {
+              "$ref": "#/$defs/ActivityEvent"
+            },
+            {
+              "$ref": "#/$defs/ExitEvent"
+            },
+            {
+              "$ref": "#/$defs/ReadOnlyEvent"
+            },
+            {
+              "$ref": "#/$defs/ReleaseEvent"
+            },
+            {
+              "$ref": "#/$defs/SessionChangeEvent"
+            }
+          ]
+        }
+      },
+      "required": [
+        "fence",
+        "bindingId",
+        "eventId",
+        "sequence",
+        "observedAt",
+        "event"
+      ],
+      "additionalProperties": false
+    },
+    "WorkspaceInspection": {
+      "type": "object",
+      "properties": {
+        "workspace": {
+          "$ref": "run.schema.json#/$defs/Workspace"
+        },
+        "identityMatches": {
+          "type": "boolean"
+        },
+        "registryMatches": {
+          "type": "boolean"
+        },
+        "head": {
+          "type": "string",
+          "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+        },
+        "dirty": {
+          "type": "boolean"
+        },
+        "untracked": {
+          "type": "boolean"
+        },
+        "ignored": {
+          "type": "boolean"
+        },
+        "extraCommits": {
+          "type": "boolean"
+        },
+        "unpreservedObjects": {
+          "type": "boolean"
+        },
+        "sessionPreservedOutsideWorkspace": {
+          "type": "boolean"
+        },
+        "observedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "workspace",
+        "identityMatches",
+        "registryMatches",
+        "head",
+        "dirty",
+        "untracked",
+        "ignored",
+        "extraCommits",
+        "unpreservedObjects",
+        "sessionPreservedOutsideWorkspace",
+        "observedAt"
+      ],
+      "additionalProperties": false
+    }
+  }
+}
