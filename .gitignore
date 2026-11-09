@@ -1,3 +1,10 @@
 # Herdr generates editor support when checking a mod.
 mods/*/gpui-kit.d.ts
 mods/*/jsconfig.json
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
