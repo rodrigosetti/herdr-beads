@@ -48,6 +48,9 @@ export default class BeadsDashboard extends View {
     cx.spawn(async (cx) => {
       for (;;) {
         if (!this.actions.length) await new Promise((resolve) => { this.wakeAction = resolve; });
+        // A JS wake can resume inside a row's host call. Yield to the dashboard's
+        // native task before creating entities, or releasing that row releases siblings.
+        await cx.sleep(0);
         while (this.actions.length) this.actions.shift()(cx);
       }
     });
