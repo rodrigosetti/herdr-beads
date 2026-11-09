@@ -291,7 +291,10 @@ export default class BeadsDashboard extends View {
       : div().flex_none().w(58);
     return h_flex().id(`bead-${issue.id}`).flex_none().h(68).pl(10 + Math.min(depth, 8) * 18).pr(12).py(10).gap(8).items_center()
       .border_b(1).border_color(t.border).cursor_pointer().bg(this.selected === issue.id ? t.selected : issue.issue_type === "epic" ? t.surface : t.background)
-      .hover((style) => style.bg(t.hover)).on_click(() => this.dispatch((cx) => this.select(issue.id, cx)))
+      .hover((style) => style.bg(t.hover)).on_click((_event, cx) => {
+        cx.stop_propagation();
+        this.dispatch((cx) => this.select(issue.id, cx));
+      })
       .child(fold)
       .child(div().w(27).flex_none().text_size(11).font_semibold().text_color(priorityColor).child(`P${issue.priority ?? "?"}`))
       .child(v_flex().flex_1().min_w(0).gap(5).child(title).child(info))
@@ -323,7 +326,7 @@ export default class BeadsDashboard extends View {
     if (index >= 0) { this.scroll.scroll_to_item(index, "center"); this.revealPending = null; }
     const name = this.project?.folder.replace(/[\\/]$/, "").split(/[\\/]/).pop() || "Project";
     return v_flex().id("beads-dashboard").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(13)
-      .track_focus(this.handle).on_mouse_down("left", () => this.handle.focus())
+      .track_focus(this.handle).on_click(() => this.handle.focus())
       .child(v_flex().flex_none().p(16).gap(12).border_b(1).border_color(t.border)
         .child(h_flex().gap(10).items_center()
           .child(v_flex().flex_1().min_w(0).gap(4)
