@@ -1,4 +1,4 @@
-"""Epic policy regressions against disposable, embedded Beads databases.
+"""Read-only epic progress regressions against disposable embedded Beads databases.
 
 Run: python3 -m unittest epic_test
 No inherited Beads, Dolt, git routing or user configuration reaches these DBs.
@@ -15,9 +15,9 @@ import tempfile
 import unittest
 
 
-reconcile_epics = runpy.run_path(
+observe_epics = runpy.run_path(
     str(Path(__file__).parent / "bin/beads_epics.py")
-)["reconcile_epics"]
+)["observe_epics"]
 
 
 class IsolatedProject:
@@ -87,133 +87,105 @@ class EpicReconciliationTests(unittest.TestCase):
         self.project.bd("close", issue_id, "--reason", "Regression fixture completion")
 
     def reconcile(self):
-        result = reconcile_epics(self.project)
+        result = observe_epics(self.project)
         self.assertFalse(result["errors"], result)
         return result
 
     def row(self, result, issue_id):
         return next(row for row in result["epics"] if row["id"] == issue_id)
 
-    def test_closes_without_sessions_and_preserves_metadata_and_unrelated_tasks(self):
-        metadata = {"custom": {"answer": 42}, "omp_session": {"legacy": "untouched"}}
-        epic = self.create("collection", "epic", metadata=json.dumps(metadata),
-                           labels="retain", assignee="epic-reconciler", priority="1")
-        child = self.create("arbitrary-child", parent=epic)
-        unrelated = self.create("unrelated", metadata='{"untouched":true}')
-        self.close(child)
-        before_task = self.project.show(unrelated)
-        before_child = self.project.show(child)
-        result = self.reconcile()
-        self.assertEqual(result["closed"], [epic])
-        row = self.row(result, epic)
-        self.assertEqual((row["status"], row["closed_children"], row["total_children"]),
-                         ("closed", 1, 1))
-        stored = self.project.show(epic)
-        self.assertEqual(stored["metadata"], metadata)
-        self.assertEqual(stored["labels"], ["retain"])
-        self.assertEqual(stored["assignee"], "epic-reconciler")
-        self.assertEqual(stored["priority"], 1)
-        after_child = self.project.show(child)
-        for field in ("status", "updated_at", "revision", "metadata"):
-            self.assertEqual(after_child.get(field), before_child.get(field))
-        self.assertEqual(self.project.show(unrelated), before_task)
-        second = self.reconcile()
-        self.assertEqual(second["closed"], [])
-        self.assertEqual(second["reopened"], [])
-
-    def test_empty_epics_stay_open_and_previously_closed_empty_reopens(self):
-        open_epic = self.create("empty-open", "epic")
-        closed_epic = self.create("empty-closed", "epic")
-        self.close(closed_epic)
-        result = self.reconcile()
-        self.assertEqual(result["closed"], [])
-        self.assertEqual(result["reopened"], [closed_epic])
-        for issue_id in (open_epic, closed_epic):
-            row = self.row(result, issue_id)
-            self.assertEqual((row["total_children"], row["closed_children"], row["status"]),
-                             (0, 0, "open"))
-
-    def test_reopened_child_reopens_epic_and_next_completion_closes_it(self):
-        epic = self.create("parent", "epic")
+    def test_completed_children_report_eligibility_without_closing_or_metadata_writes(self):
+        epic = self.create("collection", "epic", metadata='{"preserved":{"answer":42}}')
         child = self.create("work", parent=epic)
         self.close(child)
-        self.reconcile()
+        before = {issue_id: self.project.show(issue_id) for issue_id in (epic, child)}
+        for _ in range(2):
+            row = self.row(self.reconcile(), epic)
+            self.assertTrue(row["eligible"])
+            self.assertEqual((row["status"], row["closed_children"], row["total_children"]), ("open", 1, 1))
+        self.assertEqual({issue_id: self.project.show(issue_id) for issue_id in before}, before)
+
+    def test_externally_closed_epic_and_reopened_child_are_observations_only(self):
+        epic = self.create("observed", "epic")
+        child = self.create("child", parent=epic)
+        self.close(child)
+        self.close(epic)
         self.project.bd("update", child, "--status", "open")
-        result = self.reconcile()
-        self.assertEqual(result["reopened"], [epic])
-        self.assertEqual(self.row(result, epic)["closed_children"], 0)
-        self.close(child)
-        self.assertEqual(self.reconcile()["closed"], [epic])
+        before = self.project.show(epic)
+        row = self.row(self.reconcile(), epic)
+        self.assertFalse(row["eligible"])
+        self.assertEqual((row["status"], row["closed_children"]), ("closed", 0))
+        self.assertEqual(self.project.show(epic), before)
 
-    def test_arbitrary_id_addition_and_reparent_use_actual_edges_not_prefixes(self):
-        epic = self.create("root", "epic")
-        child = self.create("complete", parent=epic)
-        self.close(child)
-        self.reconcile()
-        added = self.create("totally-unrelated-id", parent=epic)
+    def test_empty_epics_never_become_eligible_or_change_status(self):
+        opened = self.create("empty", "epic")
+        closed = self.create("closed-empty", "epic")
+        self.close(closed)
         result = self.reconcile()
-        self.assertEqual(result["reopened"], [epic])
-        self.assertEqual(self.row(result, epic)["total_children"], 2)
-        # A dotted-looking ID is NOT a child without its parent edge.
-        pretender = self.create("root.fake")
-        # Keep this fixture explicitly parentless despite its dotted ID.
-        self.project.bd("update", pretender, "--parent", "")
-        self.project.bd("update", added, "--parent", "")
-        result = self.reconcile()
-        self.assertEqual(self.row(result, epic)["status"], "closed")
-        self.assertEqual(self.project.show(pretender)["status"], "open")
-        self.project.bd("update", child, "--parent", "")
-        result = self.reconcile()
-        self.assertEqual(self.row(result, epic)["status"], "open")
-        self.assertEqual(self.row(result, epic)["total_children"], 0)
+        for issue_id in (opened, closed):
+            row = self.row(result, issue_id)
+            self.assertFalse(row["eligible"])
+            self.assertEqual((row["total_children"], row["closed_children"]), (0, 0))
+        self.assertEqual(self.project.show(opened)["status"], "open")
+        self.assertEqual(self.project.show(closed)["status"], "closed")
 
-    def test_nested_epics_close_and_reopen_bottom_up_with_direct_progress(self):
-        root = self.create("a-root", "epic")
-        middle = self.create("m-middle", "epic", parent=root)
-        inner = self.create("z-inner", "epic", parent=middle)
-        leaf = self.create("leaf", parent=inner)
+    def test_nested_progress_counts_direct_children_without_transitive_closure(self):
+        root = self.create("root", "epic")
+        middle = self.create("middle", "epic", parent=root)
+        leaf = self.create("leaf", parent=middle)
         self.close(leaf)
         result = self.reconcile()
-        self.assertEqual(result["closed"], [inner, middle, root])
-        for issue_id in (root, middle, inner):
-            row = self.row(result, issue_id)
-            self.assertEqual((row["closed_children"], row["total_children"]), (1, 1))
-        self.project.bd("update", leaf, "--status", "in_progress")
-        result = self.reconcile()
-        self.assertEqual(result["reopened"], [inner, middle, root])
-        self.assertTrue(all(row["status"] == "open" for row in result["epics"]))
+        self.assertEqual((self.row(result, root)["closed_children"], self.row(result, root)["total_children"]), (0, 1))
+        self.assertTrue(self.row(result, middle)["eligible"])
+        self.assertEqual(self.project.show(middle)["status"], "open")
 
-    def test_unfinished_child_statuses_never_count_as_closed(self):
-        epic = self.create("active", "epic")
-        children = [self.create("status-" + status, parent=epic)
-                    for status in ("open", "in_progress", "blocked", "deferred")]
-        for child, status in zip(children, ("open", "in_progress", "blocked", "deferred")):
+    def test_parent_edges_not_dotted_ids_determine_membership_and_reparenting(self):
+        epic = self.create("parent", "epic")
+        child = self.create("arbitrary", parent=epic)
+        pretender = self.create("parent.fake")
+        self.project.bd("update", pretender, "--parent", "")
+        self.close(child)
+        row = self.row(self.reconcile(), epic)
+        self.assertEqual((row["closed_children"], row["total_children"]), (1, 1))
+        self.project.bd("update", child, "--parent", "")
+        row = self.row(self.reconcile(), epic)
+        self.assertEqual((row["closed_children"], row["total_children"], row["eligible"]), (0, 0, False))
+
+    def test_unfinished_statuses_do_not_count_as_closed(self):
+        epic = self.create("unfinished", "epic")
+        for status in ("open", "in_progress", "blocked", "deferred"):
+            child = self.create("child-" + status, parent=epic)
             self.project.bd("update", child, "--status", status)
-        result = self.reconcile()
-        row = self.row(result, epic)
-        self.assertEqual((row["status"], row["closed_children"], row["total_children"]),
-                         ("open", 0, 4))
+        row = self.row(self.reconcile(), epic)
+        self.assertEqual((row["closed_children"], row["total_children"], row["eligible"]), (0, 4, False))
 
-    def test_live_blocker_holds_only_its_epic_and_keeps_progress_visible(self):
+    def test_project_read_failure_holds_only_affected_epic(self):
         held = self.create("held", "epic")
-        held_child = self.create("held-work", parent=held)
-        self.close(held_child)
-        blocker = self.create("external-blocker")
-        self.project.bd("dep", "add", held, blocker)
         free = self.create("free", "epic")
-        free_child = self.create("free-work", parent=free)
-        self.close(free_child)
-        before = self.project.show(blocker)
-        result = reconcile_epics(self.project)
-        self.assertIn(held, [error["id"] for error in result["errors"]])
-        row = self.row(result, held)
-        self.assertTrue(row["held"])
-        self.assertEqual((row["status"], row["total_children"], row["closed_children"]),
-                         ("open", 1, 1))
-        self.assertEqual(self.row(result, free)["status"], "closed")
-        self.assertEqual(self.project.show(blocker), before)
-        self.close(blocker)
-        self.assertEqual(self.row(self.reconcile(), held)["status"], "closed")
+        project = self.project
+        class ReadFailure:
+            def bd(self, *args):
+                if args[:3] == ("list", "--parent", held):
+                    raise RuntimeError("database temporarily unavailable")
+                if args[0] != "list":
+                    raise AssertionError("Observer attempted a status mutation")
+                return project.bd(*args)
+        result = observe_epics(ReadFailure())
+        self.assertEqual(result["errors"][0]["id"], held)
+        self.assertEqual(self.row(result, free)["status"], "open")
+
+    def test_installed_launcher_epic_refresh_never_closes(self):
+        epic = self.create("ui-parent", "epic")
+        child = self.create("ui-child", parent=epic)
+        self.close(child)
+        before = self.project.show(epic)
+        launcher = str(Path(__file__).parent.resolve() / "bin/go-bd")
+        result = subprocess.run([sys.executable, launcher, "--reconcile-epics", "--json"],
+                                cwd=self.project.root, env=self.project.env, text=True,
+                                capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.row(json.loads(result.stdout), epic)["eligible"])
+        self.assertEqual(self.project.show(epic), before)
 
     def test_launcher_cli_rejects_epics_without_receipts_or_workspaces(self):
         epic = self.create("sessionless", "epic", metadata='{"preserved":{"answer":42}}')
@@ -248,47 +220,6 @@ class EpicReconciliationTests(unittest.TestCase):
                 self.assertFalse((Path(env["HOME"]) / ".omp").exists())
                 self.assertFalse((self.project.root / ".git/worktrees").exists())
 
-    def test_child_added_between_snapshot_and_close_is_refused_without_force(self):
-        epic = self.create("racing-parent", "epic")
-        child = self.create("old-work", parent=epic)
-        self.close(child)
-        project = self.project
-        added = None
-
-        class AddBeforeClose:
-            def bd(wrapper, *args):
-                nonlocal added
-                if args[0] == "close" and args[1] == epic and added is None:
-                    added = self.create("new-work", parent=epic)
-                return project.bd(*args)
-
-        result = reconcile_epics(AddBeforeClose())
-        self.assertIsNotNone(added)
-        self.assertIn(epic, [error["id"] for error in result["errors"]])
-        self.assertEqual(self.row(result, epic)["status"], "open")
-        self.assertEqual(self.project.show(added)["status"], "open")
-
-    def test_removing_last_child_during_close_is_detected_and_repaired(self):
-        epic = self.create("removal-parent", "epic")
-        child = self.create("removed-work", parent=epic)
-        self.close(child)
-        project = self.project
-        removed = False
-
-        class RemoveBeforeClose:
-            def bd(wrapper, *args):
-                nonlocal removed
-                if args[0] == "close" and args[1] == epic and not removed:
-                    removed = True
-                    project.bd("update", child, "--parent", "")
-                return project.bd(*args)
-
-        result = reconcile_epics(RemoveBeforeClose())
-        self.assertFalse(result["errors"], result)
-        self.assertEqual(result["closed"], [epic])
-        self.assertEqual(result["reopened"], [epic])
-        self.assertEqual(self.row(result, epic)["status"], "open")
-        self.assertEqual(self.row(result, epic)["total_children"], 0)
 
 
 if __name__ == "__main__":

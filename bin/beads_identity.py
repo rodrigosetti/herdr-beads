@@ -8,18 +8,41 @@ import uuid
 from beads_contract import Refusal, now, validate
 
 
+_executables = None
+
+
+def configure_executables(executables):
+    """Pin service commands once at startup; never resolve tools from a shell."""
+    global _executables
+    _executables = dict(executables)
+
+
+def executable(name):
+    if _executables is None or '/' in name:
+        return name
+    path = _executables.get(name)
+    if not path:
+        raise Refusal('unsupported_capability', f'Executable {name} is not configured; affected operation is unavailable.',
+                      True, capability=name)
+    if not Path(path).is_absolute():
+        raise Refusal('unsupported_capability', f'Executable {name} must be an absolute path.', capability=name)
+    return path
+
+
 def command(argv, cwd, *, env=None, timeout=3):
     clean = dict(os.environ if env is None else env)
     for key in tuple(clean):
         if key.startswith('GIT_'):
             clean.pop(key)
+    argv = [executable(argv[0]), *argv[1:]]
     try:
         result = subprocess.run(argv, cwd=cwd, env=clean, text=True,
                                 capture_output=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise Refusal('evidence_unavailable', f'{argv[0]} unavailable: {error}', True) from error
     if result.returncode:
-        raise Refusal('evidence_unavailable', f'{argv[0]}: {result.stderr.strip()[:500]}', True)
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise Refusal('evidence_unavailable', f'{argv[0]} failed ({result.returncode}): {detail[:500]}', True)
     return result.stdout.strip()
 
 
