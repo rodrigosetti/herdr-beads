@@ -248,6 +248,7 @@ class ControllerServer:
         self.controller = controller
         self.path = Path(socket_path) if socket_path is not None else default_socket_path()
         self.stopped = threading.Event()
+        self.wakeup = threading.Event()
         self.failure = None
         self.listener = None
         self.lock_fd = None
@@ -334,6 +335,8 @@ class ControllerServer:
                         response = _error(self.failure, request_id)
                     else:
                         response = self.controller.handle(value, trusted_human=False)
+                        if value.get("method") != "status" and response.get("outcome") in ("ok", "accepted"):
+                            self.wakeup.set()
                     data = _encode(response, MAX_RESPONSE_BYTES)
                 except TransportError as exc:
                     data = _encode(_error(exc, request_id), MAX_RESPONSE_BYTES)
@@ -387,6 +390,7 @@ class ControllerServer:
 
     def close(self):
         self.stopped.set()
+        self.wakeup.set()
         if self.listener is not None:
             self.listener.close()
             self.listener = None
@@ -435,7 +439,13 @@ def main(argv=None):
         else:
             from beads_controller import Controller
             from beads_identity import machine_id
-            ControllerServer(Controller(machine_id()), path).serve_forever()
+            from beads_identity import Authority
+            from beads_omp import OmpExecution
+            from beads_workspace import OmpWorkspace
+            authority = Authority()
+            execution = OmpExecution(authority=authority, socket_path=path or default_socket_path())
+            ControllerServer(Controller(machine_id(), authority=authority, execution=execution,
+                                        workspace=OmpWorkspace()), path).serve_forever()
             return 0
     except KeyboardInterrupt:
         return 0 if args.command == "serve" else 1

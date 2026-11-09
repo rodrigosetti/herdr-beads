@@ -166,6 +166,11 @@ class LifecycleTests(unittest.TestCase):
         return self.request('start_or_focus', {'expected': None, 'harness': 'omp', 'target': copy.deepcopy(self.target),
                 'newAttempt': False, 'policy': {'closeAfterIntegration': False, 'cleanupAfterRelease': False}})
 
+    def retained_start_request(self):
+        request = self.start_request()
+        request['params']['expected'] = self.condition()
+        return request
+
     def start(self):
         result = self.controller.handle(self.start_request())
         self.assertEqual(result['outcome'], 'accepted', result)
@@ -373,6 +378,299 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(result['error']['code'], 'unsupported_capability')
         self.assertIsNone(self.store.read(self.scope)['current'])
 
+
+    def test_start_requires_only_concrete_execution_capabilities(self):
+        self.execution.capabilities = ['launch', 'exact_resume', 'durable_identity', 'owner_activity']
+        self.start()
+        support = self.status()['support']
+        self.assertEqual(support['harnesses'], ['omp'])
+        self.assertEqual(support['execution']['unsupported'], ['structured_handoff', 'explicit_release', 'read_only'])
+        focused = self.controller.handle(self.retained_start_request())
+        self.assertEqual(focused['outcome'], 'accepted', focused)
+        self.drain()
+        self.assertEqual(self.status()['operation']['state'], 'succeeded')
+        self.execution.inspect = lambda run, private: 'inactive'
+        resumed = self.call('resume', {'expected': self.condition(), 'access': 'writable'})
+        self.assertEqual(resumed['outcome'], 'accepted', resumed)
+        self.drain()
+        self.assertEqual(self.execution.launches, 2)
+        read_only = self.call('resume', {'expected': self.condition(), 'access': 'read_only'})
+        self.assertEqual(read_only['error']['code'], 'unsupported_capability')
+        self.assertEqual(read_only['error']['capability'], 'read_only')
+        released = self.call('release', {'expected': self.condition(), 'reason': 'unsupported'})
+        self.assertEqual(released['error']['code'], 'unsupported_capability')
+        self.assertEqual(released['error']['capability'], 'explicit_release')
+        head = git(self.workspace.path, 'rev-parse', 'HEAD')
+        handoff = self.call('handoff', {'expected': self.condition(), 'previousCoverageRevision': 0,
+            'target': self.target, 'workspaceHead': head,
+            'requiredSubmissions': [{'submissionId': 'source', 'submissionRevision': 1, 'head': head,
+                                     'target': self.target, 'pullRequest': None}],
+            'summary': 'unsupported', 'nextSteps': [], 'risks': []})
+        self.assertEqual(handoff['error']['code'], 'unsupported_capability')
+        self.assertEqual(handoff['error']['capability'], 'structured_handoff')
+
+    def test_missing_required_start_capability_refuses_without_reservation(self):
+        required = ['launch', 'exact_resume', 'durable_identity', 'owner_activity']
+        for missing in required:
+            with self.subTest(capability=missing):
+                self.execution.capabilities = [capability for capability in required if capability != missing]
+                result = self.controller.handle(self.start_request())
+                self.assertEqual(result['error']['code'], 'unsupported_capability')
+                self.assertEqual(result['error']['capability'], missing)
+                self.assertIsNone(self.store.read(self.scope)['current'])
+        self.assertEqual(self.execution.launches, 0)
+        self.assertFalse(self.workspace.path.exists())
+
+    def test_epic_guard_does_not_depend_on_custom_authority_eligibility(self):
+        self.authority.row['issue_type'] = 'epic'
+        self.authority.eligible = lambda scope, owner: self.authority.issue(scope)
+        calls = []
+        self.execution.preflight = lambda run: calls.append('preflight')
+        self.workspace.plan = lambda run: calls.append('workspace')
+        result = self.controller.handle(self.start_request())
+        self.assertEqual(result['error']['code'], 'issue_not_ready')
+        document = self.store.read(self.scope)
+        self.assertIsNone(document['current'])
+        self.assertEqual(document['runs'], {})
+        self.assertEqual(document['operations'], {})
+        self.assertEqual(calls, [])
+        self.assertEqual(self.authority.row['status'], 'open')
+        self.assertEqual(self.execution.launches, 0)
+        self.assertFalse(self.workspace.path.exists())
+
+    def test_preflight_refuses_before_new_run_claim_or_workspace_planning(self):
+        calls = []
+        def preflight(run):
+            self.assertEqual(run['scope'], self.scope)
+            self.assertEqual(run['owner'], 'owner')
+            self.assertEqual(run['target'], self.target)
+            self.assertIsNone(run['workspace'])
+            calls.append('preflight')
+            raise Refusal('session_owned', 'Fresh metadata already owns a session.')
+        self.execution.preflight = preflight
+        self.workspace.plan = lambda run: calls.append('workspace')
+        result = self.controller.handle(self.start_request())
+        self.assertEqual(result['error']['code'], 'session_owned')
+        self.assertEqual(calls, ['preflight'])
+        self.assertEqual(self.store.read(self.scope)['runs'], {})
+        self.assertEqual(self.authority.row['status'], 'open')
+        self.assertEqual(self.execution.launches, 0)
+
+    def reject_worker_preflight(self):
+        def preflight(run):
+            raise Refusal('session_mismatch', 'Fresh metadata changed after reservation.')
+        self.execution.preflight = preflight
+        self.assertFalse(self.controller.work_once())
+        self.assertEqual(self.status()['operation']['state'], 'failed')
+        self.assertEqual(self.status()['operation']['error']['code'], 'session_mismatch')
+        self.assertEqual(self.execution.launches, 0)
+
+    def test_preflight_rechecks_metadata_before_claim(self):
+        self.controller.handle(self.start_request())
+        self.reject_worker_preflight()
+        self.assertEqual(self.authority.row['status'], 'open')
+        self.assertFalse(self.workspace.path.exists())
+
+    def test_preflight_rechecks_metadata_before_workspace_provisioning(self):
+        self.controller.handle(self.start_request())
+        self.controller.work_once()
+        self.reject_worker_preflight()
+        self.assertEqual(self.authority.row['status'], 'in_progress')
+        self.assertFalse(self.workspace.path.exists())
+
+    def test_preflight_rechecks_metadata_before_launch(self):
+        self.controller.handle(self.start_request())
+        self.controller.work_once()
+        self.controller.work_once()
+        self.reject_worker_preflight()
+        self.assertTrue(self.workspace.path.exists())
+
+    def test_retained_start_and_resume_require_current_local_owner(self):
+        self.start()
+        run = self.status()['run']
+        self.authority.owner = lambda scope: 'different-local-owner'
+        inspections = []
+        self.execution.inspect = lambda run, private: inspections.append(run) or 'inactive'
+        requests = [self.retained_start_request(),
+                    self.request('resume', {'expected': self.condition(), 'access': 'writable'})]
+        for request in requests:
+            with self.subTest(method=request['method']):
+                result = self.controller.handle(request)
+                self.assertEqual(result['error']['code'], 'owner_mismatch')
+        self.assertEqual(inspections, [])
+        self.assertEqual(self.status()['run']['fence'], run['fence'])
+        self.assertEqual(self.execution.launches, 1)
+
+    def test_inherited_blockers_prevent_focusing_active_writable_run(self):
+        self.start()
+        def blocked(scope, owner):
+            raise Refusal('issue_blocked', 'Inherited parent blocker.')
+        self.authority.eligible = blocked
+        result = self.controller.handle(self.retained_start_request())
+        self.assertEqual(result['error']['code'], 'issue_blocked')
+        self.assertEqual(self.status()['operation']['state'], 'succeeded')
+        self.assertEqual(self.execution.launches, 1)
+
+    def test_preflight_checks_actual_run_before_resume_or_focus(self):
+        self.start()
+        run = self.status()['run']
+        inspections = []
+        checked = []
+        def preflight(actual):
+            self.assertEqual(actual, run)
+            checked.append(actual['fence'])
+            raise Refusal('session_mismatch', 'Exact metadata no longer matches.')
+        self.execution.preflight = preflight
+        self.execution.inspect = lambda run, private: inspections.append(run) or 'inactive'
+        requests = [self.retained_start_request(),
+                    self.request('resume', {'expected': self.condition(), 'access': 'writable'})]
+        for request in requests:
+            result = self.controller.handle(request)
+            self.assertEqual(result['error']['code'], 'session_mismatch')
+        self.assertEqual(len(checked), 2)
+        self.assertEqual(inspections, [])
+        self.assertEqual(self.status()['run']['fence'], run['fence'])
+
+    def test_retained_start_refreshes_activity_before_exact_resume_and_binding(self):
+        self.start()
+        run = self.status()['run']
+        private = self.store.read(self.scope)['private'][run['fence']['runId']]
+        def inspect(actual, actual_private):
+            self.assertEqual(actual['fence'], run['fence'])
+            self.assertEqual(actual['execution']['session'], run['execution']['session'])
+            self.assertEqual(actual_private, private)
+            actual_private['credential'] = 'must-not-leak'
+            return 'inactive'
+        self.execution.inspect = inspect
+        accepted = self.controller.handle(self.retained_start_request())
+        self.assertEqual(accepted['outcome'], 'accepted', accepted)
+        self.assertEqual(accepted['run']['fence']['generation'], run['fence']['generation'] + 1)
+        self.drain()
+        self.assertEqual(self.status()['run']['execution']['session']['sessionId'], 'actual-session')
+        self.assertEqual(self.execution.launches, 2)
+
+    def test_explicit_resume_refreshes_stale_active_activity(self):
+        self.start()
+        run = self.status()['run']
+        inspected = []
+        def inspect(actual, private):
+            inspected.append(copy.deepcopy(actual))
+            return 'inactive'
+        self.execution.inspect = inspect
+        accepted = self.call('resume', {'expected': self.condition(), 'access': 'writable'})
+        self.assertEqual(accepted['outcome'], 'accepted', accepted)
+        self.assertEqual(inspected[0]['fence'], run['fence'])
+        self.assertEqual(accepted['run']['fence']['generation'], run['fence']['generation'] + 1)
+        self.drain()
+        self.assertEqual(self.execution.launches, 2)
+
+    def test_refreshed_active_activity_focuses_instead_of_resuming_stale_inactive_run(self):
+        self.start()
+        with self.store.transaction(self.scope) as doc:
+            doc['runs'][doc['current']]['execution']['activity'] = 'inactive'
+        run = self.status()['run']
+        self.execution.inspect = lambda actual, private: 'active'
+        accepted = self.controller.handle(self.retained_start_request())
+        self.assertEqual(accepted['outcome'], 'accepted', accepted)
+        self.assertEqual(accepted['run']['fence'], run['fence'])
+        self.assertEqual(accepted['run']['execution']['activity'], 'active')
+        self.drain()
+        self.assertEqual(self.execution.launches, 1)
+        resumed = self.call('resume', {'expected': self.condition(), 'access': 'writable'})
+        self.assertEqual(resumed['error']['code'], 'session_owned')
+
+    def test_unknown_inspected_activity_refuses_start_and_resume(self):
+        self.start()
+        run = self.status()['run']
+        self.execution.inspect = lambda actual, private: 'unknown'
+        requests = [self.retained_start_request(),
+                    self.request('resume', {'expected': self.condition(), 'access': 'writable'})]
+        for request in requests:
+            result = self.controller.handle(request)
+            self.assertEqual(result['error']['code'], 'session_owned')
+        self.assertEqual(self.status()['run']['fence'], run['fence'])
+        self.assertEqual(self.execution.launches, 1)
+
+    def test_inspection_io_failure_is_recoverable_refusal_without_resume(self):
+        self.start()
+        run = self.status()['run']
+        def inspect(actual, private):
+            raise OSError('terminal socket unavailable')
+        self.execution.inspect = inspect
+        result = self.controller.handle(self.retained_start_request())
+        self.assertEqual(result['outcome'], 'refused')
+        self.assertEqual(result['error']['code'], 'evidence_unavailable')
+        self.assertTrue(result['error']['retryable'])
+        self.assertEqual(self.status()['run']['fence'], run['fence'])
+        self.assertEqual(self.execution.launches, 1)
+
+    def test_preflight_io_failure_refuses_before_reservation(self):
+        def preflight(run):
+            raise OSError('metadata unavailable')
+        self.execution.preflight = preflight
+        result = self.controller.handle(self.start_request())
+        self.assertEqual(result['outcome'], 'refused')
+        self.assertEqual(result['error']['code'], 'evidence_unavailable')
+        self.assertTrue(result['error']['retryable'])
+        self.assertIsNone(self.store.read(self.scope)['current'])
+
+    def test_adapter_io_failure_after_launch_remains_recoverable_without_reperform(self):
+        original = self.execution.perform
+        def perform(step, run, intent, private):
+            receipt = original(step, run, intent, private)
+            if step == 'launch':
+                raise OSError('receipt transport interrupted after durable effect')
+            return receipt
+        self.execution.perform = perform
+        self.controller.handle(self.start_request())
+        self.controller.work_once()
+        self.controller.work_once()
+        self.assertFalse(self.controller.work_once())
+        self.assertEqual(self.status()['operation']['state'], 'running')
+        self.assertEqual(self.status()['operation']['error']['code'], 'evidence_unavailable')
+        self.drain()
+        self.assertEqual(self.status()['operation']['state'], 'succeeded')
+        self.assertEqual(self.execution.launches, 1)
+
+    def test_worker_io_failure_outside_adapter_remains_recoverable(self):
+        self.start()
+        run = self.status()['run']
+        original = self.controller.reconcile
+        def reconcile(actual, private):
+            raise OSError('integration observation unavailable')
+        self.controller.reconcile = reconcile
+        accepted = self.call('reconcile', {'expected': self.condition()})
+        self.assertEqual(accepted['outcome'], 'accepted', accepted)
+        self.assertFalse(self.controller.work_once())
+        status = self.status()
+        self.assertEqual(status['operation']['state'], 'running')
+        self.assertEqual(status['operation']['error']['code'], 'evidence_unavailable')
+        operation = self.store.read(self.scope)['operations'][status['operation']['operationId']]
+        self.assertTrue(operation['intent']['started'])
+        self.assertEqual(status['run']['workspace'], run['workspace'])
+        self.assertTrue(self.workspace.path.exists())
+        self.controller.reconcile = original
+        self.drain()
+        self.assertEqual(self.status()['operation']['state'], 'succeeded')
+        self.assertEqual(self.execution.launches, 1)
+
+    def test_uncertain_launch_recovery_does_not_preflight_its_unreceipted_metadata_again(self):
+        def preflight(run):
+            if self.execution.launches:
+                raise Refusal('session_owned', 'Metadata already contains launched session.')
+        self.execution.preflight = preflight
+        self.controller.handle(self.start_request())
+        self.controller.work_once()
+        self.controller.work_once()
+        self.execution.crash = True
+        with self.assertRaises(SystemExit):
+            self.controller.work_once()
+        self.execution.crash = False
+        self.controller = self.restart()
+        self.drain()
+        self.assertEqual(self.status()['operation']['state'], 'succeeded')
+        self.assertEqual(self.execution.launches, 1)
+
     def test_policy_cannot_enable_close_or_delete(self):
         for name in ('closeAfterIntegration', 'cleanupAfterRelease'):
             request = self.start_request()
@@ -416,14 +714,24 @@ class LifecycleTests(unittest.TestCase):
                 observed = self.controller.handle(self.request('observe', {
                     'credential': private['credential'], 'observation': receipt['observation']}))
                 self.assertEqual(observed['outcome'], 'ok', observed)
+                activity = copy.deepcopy(receipt['observation'])
+                activity.update(eventId='early-turn', sequence=activity['sequence'] + 1)
+                activity['event'] = {'kind': 'activity', 'activity': 'active', 'turn': 'working'}
+                advanced = self.controller.handle(self.request('observe', {
+                    'credential': private['credential'], 'observation': activity}))
+                self.assertEqual(advanced['outcome'], 'ok', advanced)
                 receipt['private'] = {'durableAssociation': 'actual-session-file'}
             return receipt
         self.execution.perform = perform
-        self.start()
+        self.assertEqual(self.controller.handle(self.start_request())['outcome'], 'accepted')
+        self.drain()
         run_id = self.status()['run']['fence']['runId']
         self.controller = self.restart()
         self.assertEqual(self.store.read(self.scope)['private'][run_id]['adapter']['durableAssociation'], 'actual-session-file')
         self.assertEqual(self.execution.launches, 1)
+        retained = self.store.read(self.scope)['private'][run_id]
+        self.assertEqual(retained['sequence'], 2)
+        self.assertEqual(self.status()['run']['execution']['state'], 'running')
 
     def test_prelaunch_failure_can_be_explicitly_released_without_workspace(self):
         def fail(step, run, intent, private):

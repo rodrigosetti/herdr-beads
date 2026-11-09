@@ -9,7 +9,7 @@ import subprocess
 import uuid
 
 from beads_contract import Refusal, now, validate
-from beads_identity import canonical_path, command, repository_identity
+from beads_identity import canonical_path, command, executable, repository_identity
 
 
 def ancestor(repository, source, target):
@@ -19,7 +19,7 @@ def ancestor(repository, source, target):
     env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
     env.update(GIT_NO_REPLACE_OBJECTS='1', GIT_GRAFT_FILE=os.devnull, GIT_NO_LAZY_FETCH='1')
     try:
-        result = subprocess.run(['git', 'merge-base', '--is-ancestor', source, target],
+        result = subprocess.run([executable('git'), 'merge-base', '--is-ancestor', source, target],
                                 cwd=repository, capture_output=True, text=True, timeout=3,
                                 env=env)
     except (OSError, subprocess.TimeoutExpired) as error:
