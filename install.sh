@@ -2,6 +2,14 @@
 set -euo pipefail
 
 source_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+python="${HERDR_BEADS_PYTHON:-python3}"
+command="${1:-install}"
+case "$command" in
+  status|restart|stop|--help|-h)
+    exec "$python" "$source_dir/bin/beads_service_install.py" "$@"
+    ;;
+esac
+"$python" "$source_dir/bin/beads_service_install.py" "$@"
 app_home="${HERDR_APP_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr-app}"
 bin_home="$HOME/.local/bin"
 
