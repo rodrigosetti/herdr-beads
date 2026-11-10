@@ -215,6 +215,48 @@ export default function (pi) {
     return `Bead ${config.scope.issueId}\nCanonical database: ${config.scope.beadsDir}\nRun: ${config.fence.runId}, attempt ${config.fence.attempt}, generation ${config.fence.generation}\nSession access: ${access}${frozen ? ' (fenced)' : ''}\n${POLICY}\n/bead-context shows current controller state. /bead-handoff <JSON HandoffParams without expected> records an exact mode/target/HEAD and complete requiredSubmissions, summary, nextSteps, risks. local-target needs no PR/network; github-pr requires exact provider repository, PR number/URL, expected base ref and submitted head. /bead-release <reason> is an explicit idle-only owner action, not end-of-turn. Trusted rewritten-history receipts are separate operator actions, never agent merge proof.`;
   }
 
+  function ownerContext(run) {
+    const closure = run.closure;
+    const lines = [
+      context(),
+      `Closure state: ${closure.state}`,
+      `Closure status: ${closure.reason ?? 'none'}`,
+      `Observed Beads status: ${run.issueObservation?.status ?? 'unknown'} (assignee: ${run.issueObservation?.assignee ?? 'unknown'}, observed: ${run.issueObservation?.observedAt ?? 'never'})`,
+      `Merge coverage: ${run.coverage.state}, revision ${run.coverage.revision}, workspace HEAD ${run.coverage.workspaceHead ?? 'unknown'}`,
+      `Cleanup: ${run.cleanup.state}; retention reasons: ${run.cleanup.blockers.join(', ') || 'none'}`,
+    ];
+    const handoff = closure.state === 'awaiting_manual' ? closure.handoff : null;
+    if (handoff) {
+      lines.push(
+        'Manual closure handoff (review only; no execution performed)',
+        `Handoff: ${handoff.handoffId}, created ${handoff.createdAt}`,
+        `Canonical database: ${handoff.scope.beadsDir}`,
+        `Full issue: ${handoff.scope.issueId}`,
+        `Expected owner: ${handoff.owner}`,
+        `Expected run: ${handoff.fence.runId}, attempt ${handoff.fence.attempt}, generation ${handoff.fence.generation}`,
+        `Coverage revision: ${handoff.coverageRevision}; workspace HEAD: ${handoff.workspaceHead}`,
+        `Mode: ${handoff.target.mode}`,
+        `Target: ${JSON.stringify(handoff.target)}`,
+        'Required integrated submissions:',
+      );
+      for (const submission of handoff.submissions) {
+        const identity = submission.identity;
+        lines.push(
+          `Submission: ${identity.submissionId}, revision ${identity.submissionRevision}, SHA ${identity.head}; state: ${submission.state}`,
+          `Submission target: ${JSON.stringify(identity.target)}; pull request: ${JSON.stringify(identity.pullRequest)}`,
+          `Evidence: ${JSON.stringify(submission.evidence)}`,
+        );
+      }
+      lines.push(
+        `Evidence reason: ${handoff.evidenceReason}`,
+        `Warning: ${handoff.warning}`,
+        `Review: ${handoff.review}`,
+      );
+      if (closure.manualCommand) lines.push('Separate owner-reviewed shell command:', '', closure.manualCommand);
+    }
+    return lines.join('\n');
+  }
+
   async function release(reason, ctx) {
     if (!reason.trim()) throw new Error('usage: /bead-release <reason>');
     if (released || relinquishing || stopped) throw new Error('session is already relinquishing ownership; inspect controller status');
@@ -330,7 +372,7 @@ export default function (pi) {
   for (const [name, description, action] of [
     ['bead-context', 'Show Bead ownership policy and current controller state', async (_args, ctx) => {
       const run = await current();
-      ctx.ui.notify(`${context()}\n${JSON.stringify(run)}`, 'info');
+      ctx.ui.notify(ownerContext(run), 'info');
     }],
     ['bead-handoff', 'Record exact integration submission: JSON HandoffParams without expected', async (args, ctx) => {
       if (frozen || released || access !== 'writable') throw new Error('handoff refused: session is fenced/read-only');
