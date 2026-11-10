@@ -32,7 +32,10 @@
           "minLength": 1
         },
         "target": {
-          "$ref": "run.schema.json#/$defs/Target"
+          "anyOf": [
+            {"$ref": "run.schema.json#/$defs/Target"},
+            {"type": "null"}
+          ]
         },
         "policy": {
           "$ref": "run.schema.json#/$defs/Policy"
@@ -48,6 +51,19 @@
         "policy",
         "newAttempt"
       ],
+      "additionalProperties": false
+    },
+    "AdoptParams": {
+      "type": "object",
+      "properties": {
+        "expected": {
+          "anyOf": [
+            {"$ref": "run.schema.json#/$defs/Precondition"},
+            {"type": "null"}
+          ]
+        }
+      },
+      "required": ["expected"],
       "additionalProperties": false
     },
     "ResumeParams": {
@@ -208,6 +224,7 @@
     },
     "Method": {
       "enum": [
+        "adopt_legacy",
         "start_or_focus",
         "resume",
         "handoff",
@@ -220,6 +237,18 @@
     },
     "Request": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "apiVersion": {"const": 1},
+            "requestId": {"type": "string", "minLength": 1},
+            "method": {"const": "adopt_legacy"},
+            "scope": {"$ref": "#/$defs/Selector"},
+            "params": {"$ref": "#/$defs/AdoptParams"}
+          },
+          "required": ["apiVersion", "requestId", "method", "scope", "params"],
+          "additionalProperties": false
+        },
         {
           "type": "object",
           "properties": {
@@ -655,6 +684,7 @@
         "action": {
           "enum": [
             "status",
+            "adopted",
             "focused",
             "started",
             "resumed",

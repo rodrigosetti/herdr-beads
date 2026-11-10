@@ -24,7 +24,7 @@ CAPABILITIES = ['launch', 'exact_resume', 'durable_identity', 'owner_activity',
                 'structured_handoff', 'explicit_release', 'read_only']
 START_CAPABILITIES = ('launch', 'exact_resume', 'durable_identity', 'owner_activity')
 METHOD_ACTION = {'start_or_focus': 'started', 'resume': 'resumed', 'release': 'release_requested',
-                 'reconcile': 'reconciled'}
+                 'reconcile': 'reconciled', 'adopt_legacy': 'adopted'}
 
 
 def key(identity):
@@ -171,7 +171,9 @@ class Controller:
                     result = self.observe(request, doc, run)
                 else:
                     expected(run, params.get('expected'))
-                    if method == 'start_or_focus':
+                    if method == 'adopt_legacy':
+                        result = self.adopt(request, doc, run)
+                    elif method == 'start_or_focus':
                         result = self.start(request, doc, run)
                     else:
                         if not run:
@@ -273,11 +275,57 @@ class Controller:
         private = doc['private'].setdefault(run['fence']['runId'], {})
         private.update({'bindingId': str(uuid.uuid4()), 'credential': secrets.token_urlsafe(32), 'sequence': 0, 'events': {}})
 
-    def start(self, request, doc, run):
-        params = request['params']
+    @staticmethod
+    def new_run(scope, owner, attempt, target, policy):
+        timestamp = now()
+        return {'schemaVersion': 1, 'fence': {'runId': str(uuid.uuid4()), 'attempt': attempt, 'generation': 1},
+                'revision': 1, 'scope': copy.deepcopy(scope), 'owner': owner, 'disposition': 'current',
+                'harness': 'omp', 'policy': copy.deepcopy(policy), 'target': copy.deepcopy(target),
+                'workspace': None, 'execution': {'state': 'preparing', 'access': 'writable', 'activity': 'unknown',
+                'session': None, 'terminal': None, 'observedAt': None, 'readOnlyAcknowledged': False},
+                'coverage': {'revision': 0, 'workspaceHead': None, 'required': [], 'state': 'unsubmitted'},
+                'submissions': [], 'release': {'state': 'held', 'receipt': None},
+                'closure': {'state': 'not_requested', 'evidenceIds': [], 'observedAt': None,
+                            'reason': 'Integration destination unbound — explicit handoff required.' if target is None else None,
+                            'manualCommand': None},
+                'cleanup': {'state': 'held', 'blockers': ['manual_cleanup_required'], 'checkedAt': None},
+                'issueObservation': None, 'createdAt': timestamp, 'updatedAt': timestamp}
+
+    def adopt(self, request, doc, run):
+        self.require(*START_CAPABILITIES)
+        if not self.execution or not hasattr(self.execution, 'adopt') or not self.workspace or not hasattr(self.workspace, 'adopt'):
+            raise Refusal('unsupported_capability', 'Exact legacy execution/workspace adoption is unavailable.')
+        if run and run['execution']['session']:
+            # Repeated adoption uses the same exact focus/resume path, never a new attempt.
+            return self.start(request, doc, run, params={
+                'harness': run['harness'], 'target': run['target'],
+                'policy': run['policy'], 'newAttempt': False})
+        if run:
+            self.no_pending(doc, run)
+            self.check_owner(run)
+            self.guard_issue(run, writable=True)
+            if not doc['private'][run['fence']['runId']].get('adoption'):
+                raise Refusal('session_missing', 'This reservation is not a legacy adoption; no identity substitution.')
+        else:
+            owner = self.authority.owner(request['scope'])
+            issue = self.authority.eligible(request['scope'], owner)
+            if issue.get('status') != 'in_progress' or issue.get('assignee') != owner:
+                raise Refusal('owner_mismatch', 'Adoption requires the already self-owned in-progress Bead; no claim is made.')
+            run = self.new_run(request['scope'], owner, 1, None,
+                               {'closeAfterIntegration': False, 'cleanupAfterRelease': False})
+            doc['current'] = run['fence']['runId']
+            doc['runs'][doc['current']] = run
+            doc['private'][doc['current']] = {'adoption': True}
+            self.binding(doc, run)
+        doc['audit'].append({'kind': 'adoption_intent', 'fence': copy.deepcopy(run['fence']), 'at': now()})
+        return self.enqueue(request, doc, run, ['adopt'])
+
+    def start(self, request, doc, run, params=None):
+        params = request['params'] if params is None else params
         if params['harness'] != 'omp':
             raise Refusal('unsupported_harness', 'Only the concrete omp execution adapter is supported.')
-        self.target(params['target'], request['scope'])
+        if params['target'] is not None:
+            self.target(params['target'], request['scope'])
         if run and not params['newAttempt']:
             if run['target'] != params['target'] or run['policy'] != params['policy']:
                 raise Refusal('target_changed', 'Current target/policy differs; declare a writable handoff or explicit new attempt.')
@@ -304,6 +352,8 @@ class Controller:
             run['execution'].update(state='starting', readOnlyAcknowledged=False)
             touch(run)
             return self.enqueue(request, doc, run, ['resume'])
+        if params['target'] is None:
+            raise Refusal('target_changed', 'New runs require an explicit integration destination; use adopt_legacy for existing history.')
         self.require(*START_CAPABILITIES)
         if not self.workspace:
             raise Refusal('unsupported_capability', 'omp-worktree provider is not installed.')
@@ -315,17 +365,7 @@ class Controller:
         self.authority.eligible(request['scope'], owner)
         attempt = max((r['fence']['attempt'] for r in doc['runs'].values()), default=0) + 1
         previous = run
-        timestamp = now()
-        run = {'schemaVersion': 1, 'fence': {'runId': str(uuid.uuid4()), 'attempt': attempt, 'generation': 1},
-               'revision': 1, 'scope': copy.deepcopy(request['scope']), 'owner': owner, 'disposition': 'current',
-               'harness': 'omp', 'policy': copy.deepcopy(params['policy']), 'target': copy.deepcopy(params['target']),
-               'workspace': None, 'execution': {'state': 'preparing', 'access': 'writable', 'activity': 'unknown',
-               'session': None, 'terminal': None, 'observedAt': None, 'readOnlyAcknowledged': False},
-               'coverage': {'revision': 0, 'workspaceHead': None, 'required': [], 'state': 'unsubmitted'},
-               'submissions': [], 'release': {'state': 'held', 'receipt': None},
-               'closure': {'state': 'not_requested', 'evidenceIds': [], 'observedAt': None, 'reason': None, 'manualCommand': None},
-               'cleanup': {'state': 'held', 'blockers': ['manual_cleanup_required'], 'checkedAt': None},
-               'issueObservation': None, 'createdAt': timestamp, 'updatedAt': timestamp}
+        run = self.new_run(request['scope'], owner, attempt, params['target'], params['policy'])
         self.preflight(run)
         # Resource allocation is planned without effects and journaled before perform.
         if not hasattr(self.workspace, 'plan'):
@@ -595,7 +635,7 @@ class Controller:
             intent['started'] = True
             public.update(state='running', phase={'claim': 'reserved', 'workspace': 'workspace', 'launch': 'launch',
                           'resume': 'launch', 'focus': 'inspecting', 'release': 'releasing',
-                          'read_only': 'binding', 'reconcile': 'verifying'}[step], updatedAt=now())
+                          'read_only': 'binding', 'reconcile': 'verifying', 'adopt': 'inspecting'}[step], updatedAt=now())
             if step in ('launch', 'resume'):
                 run['execution']['state'] = 'starting'
                 touch(run)
@@ -611,7 +651,12 @@ class Controller:
                 self.preflight(snapshot)
             if snapshot['workspace'] and step != 'reconcile':
                 self.check_workspace(snapshot)
-            if step == 'reconcile':
+            if step == 'adopt':
+                receipt = self.adapter_call(self.execution.adopt, snapshot,
+                           {'operationId': operation_id, 'fence': public['fence'], **saved_intent}, private)
+                if receipt is not None:
+                    receipt['workspace'] = self.adapter_call(self.workspace.adopt, snapshot, receipt['workspacePath'])
+            elif step == 'reconcile':
                 receipt = self.reconcile(snapshot, private)
             else:
                 adapter = self.authority if step == 'claim' else self.workspace if step == 'workspace' else self.execution
@@ -638,6 +683,8 @@ class Controller:
                     else:
                         run['cleanup']['blockers'].append('capability_unsupported')
                 operation['receipts'].append({'step': step, 'receipt': copy.deepcopy(receipt), 'observedAt': now()})
+                if step == 'adopt' and run['execution']['activity'] == 'active':
+                    operation['intent']['steps'].append('focus')
                 operation['intent']['index'] += 1
                 operation['intent']['started'] = False
                 operation['public'].update(updatedAt=now(), error=None)
@@ -663,7 +710,28 @@ class Controller:
             return False
 
     def apply_receipt(self, step, receipt, run, doc):
-        if step == 'claim':
+        if step == 'adopt':
+            workspace = receipt['workspace']
+            validate_workspace(workspace, run['scope'])
+            self.adapter_call(self.workspace.validate, {**copy.deepcopy(run), 'workspace': workspace})
+            session, terminal, activity = receipt['session'], receipt['terminal'], receipt['activity']
+            validate('run', session, 'Session')
+            private = doc['private'][run['fence']['runId']]
+            if (session['harness'] != run['harness'] or session['bindingId'] != private['bindingId']
+                    or activity not in ('active', 'inactive')):
+                raise Refusal('session_mismatch', 'Adoption did not establish exact execution identity.')
+            if terminal is not None:
+                validate('run', terminal, 'Terminal')
+                if terminal['machineId'] != run['scope']['machineId']:
+                    raise Refusal('remote_machine', 'Adopted terminal belongs to another machine.')
+            if activity == 'active' and terminal is None:
+                raise Refusal('terminal_mismatch', 'Live adoption requires an exact local terminal.')
+            run['workspace'] = copy.deepcopy(workspace)
+            run['execution'].update(session=copy.deepcopy(session), terminal=copy.deepcopy(terminal),
+                                    activity=activity, state='idle' if activity == 'active' else 'stopped', observedAt=now())
+            doc['audit'].append({'kind': 'adoption_result', 'fence': copy.deepcopy(run['fence']),
+                                 'workspace': copy.deepcopy(workspace), 'session': copy.deepcopy(session), 'at': now()})
+        elif step == 'claim':
             validate('run', receipt, 'IssueObservation')
             if receipt['status'] != 'in_progress' or receipt['assignee'] != run['owner']:
                 raise Refusal('owner_mismatch', 'Observed claim does not belong to this run owner.')
@@ -712,7 +780,7 @@ class Controller:
         public.update(state='failed' if error else 'succeeded', phase='complete', updatedAt=now(),
                       error={'code': error.code, 'message': error.message} if error else None)
         if error:
-            if public['method'] in ('start_or_focus', 'resume') and run['execution']['state'] in ('preparing', 'starting'):
+            if public['method'] in ('start_or_focus', 'resume', 'adopt_legacy') and run['execution']['state'] in ('preparing', 'starting'):
                 run['execution'].update(state='failed', activity='unknown')
                 touch(run)
             result = self.failure(public['requestId'], error, run, public)
@@ -797,7 +865,8 @@ class Controller:
             by_key[canonical_json(k)]['state'] == 'integrated' and by_key[canonical_json(k)]['evidence'] for k in required)
         run['coverage']['state'] = 'integrated' if complete else 'unknown' if required else 'unsubmitted'
         run['closure'].update(state='held' if required else 'not_requested', evidenceIds=[], manualCommand=None,
-                              observedAt=issue['observedAt'], reason=receipt['error']['message'] if receipt.get('error') else 'Integration proof unavailable or invalidated.' if required else None)
+                              observedAt=issue['observedAt'], reason=receipt['error']['message'] if receipt.get('error') else 'Integration proof unavailable or invalidated.' if required else
+                              'Integration destination unbound — explicit handoff required.' if run['target'] is None else None)
         if complete:
             run['execution']['access'] = 'read_only'
             evidence_ids = [by_key[canonical_json(k)]['evidence']['evidenceId'] for k in required]

@@ -10,6 +10,10 @@ Planning queries supported `omp config get` and `worktree list` APIs. These
 may initialize omp's own settings storage, but never provision workspaces,
 create branches, alter the registry, or claim issues. Provisioning is confined
 to perform; recovery only observes the exact journaled resource.
+
+Legacy adoption observes an explicit canonical checkout and its omp/Git
+registrations only. It preserves the checkout's actual branch and does not
+choose an integration destination or provision any resource.
 """
 import copy
 import json
@@ -97,13 +101,15 @@ class OmpWorkspace:
         attempt = run['fence']['attempt']
         return issue if attempt == 1 else f'{issue}-attempt-{attempt}'
 
-    def _source(self, run):
+    def _source(self, run, *, require_target=True):
         source = run['scope']['repository']
         for value in source.values():
             canonical_path(value, 'repository_mismatch')
         if repository_identity(source['root']) != source:
             raise Refusal('repository_mismatch', 'Workspace source is not the canonical repository.')
         target = run['target']
+        if target is None and not require_target:
+            return source
         validate('run', target, 'Target')
         if target['mode'] != 'github-pr' and target['repository'] != source:
             raise Refusal('repository_mismatch', 'Workspace target must name the canonical source, never a clone.')
@@ -122,17 +128,21 @@ class OmpWorkspace:
         return {'provider': 'omp-worktree', 'backing': 'linked' if common == source['commonDir'] else 'clone',
                 'path': str(path), 'branchRef': branch, 'sourceRepository': copy.deepcopy(source), 'commonDir': common}
 
-    def _validate(self, run, workspace, rows):
+    def _validate(self, run, workspace, rows, *, require_registry=False):
         validate_workspace(workspace, run['scope'])
         path = Path(workspace['path'])
         top = self._command(['git', 'rev-parse', '--show-toplevel'], run, cwd=path)
         if str(Path(top).resolve()) != workspace['path']:
             raise Refusal('workspace_mismatch', 'Recorded workspace is not the exact checkout root.')
         matches = [row for row in rows if str(Path(row['path']).resolve()) == workspace['path']]
+        if len(matches) > 1:
+            raise Refusal('workspace_mismatch', 'Multiple omp registry entries bind this workspace path.')
+        if require_registry and not matches:
+            raise Refusal('workspace_mismatch', 'Adoption requires one exact omp source registry binding.')
         branch = workspace['branchRef'].removeprefix('refs/heads/')
         source = run['scope']['repository']
         for row in matches:
-            if (row.get('orphanReason') or row.get('branch') != branch or
+            if (row.get('orphanReason') is not None or row.get('kind') in ('orphan', 'orphaned') or row.get('branch') != branch or
                     not row.get('parentRepo') or str(Path(row['parentRepo']).resolve()) != source['root']):
                 raise Refusal('workspace_mismatch', 'omp registry no longer binds this path/branch to its canonical source.')
         if workspace['backing'] == 'clone':
@@ -145,9 +155,18 @@ class OmpWorkspace:
             if not any(row.get('worktree') and str(Path(row['worktree']).resolve()) == workspace['path'] and
                        row.get('branch') == workspace['branchRef'] for row in records):
                 raise Refusal('workspace_mismatch', 'Linked workspace is absent from the canonical Git worktree registry.')
-        if workspace['branchRef'] != f'refs/heads/{self._name(run)}':
-            raise Refusal('workspace_mismatch', 'Workspace branch does not identify this issue attempt.')
         return workspace
+
+    def adopt(self, run, path):
+        self._source(run, require_target=False)
+        if not isinstance(path, str) or not path:
+            raise Refusal('workspace_mismatch', 'Adoption requires the exact recorded workspace path.')
+        destination = canonical_path(path, 'workspace_mismatch')
+        if not destination.is_dir():
+            raise Refusal('workspace_missing', 'Recorded legacy workspace is missing; no recreation authorized.')
+        branch = self._command(['git', 'symbolic-ref', '-q', 'HEAD'], run, cwd=destination)
+        workspace = self._identity(run, destination, branch)
+        return copy.deepcopy(self._validate(run, workspace, self._registry(run), require_registry=True))
 
     def plan(self, run):
         source = self._source(run)
@@ -216,8 +235,8 @@ class OmpWorkspace:
         return {'workspace': copy.deepcopy(workspace)}
 
     def validate(self, run):
-        self._source(run)
+        self._source(run, require_target=False)
         workspace = run.get('workspace')
         if not workspace:
             raise Refusal('workspace_missing', 'No acknowledged omp workspace exists.')
-        return self._validate(run, workspace, self._registry(run))
+        return self._validate(run, workspace, self._registry(run), require_registry=run['target'] is None)

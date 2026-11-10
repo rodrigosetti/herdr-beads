@@ -1261,7 +1261,10 @@
           "$ref": "#/$defs/Policy"
         },
         "target": {
-          "$ref": "#/$defs/Target"
+          "anyOf": [
+            {"$ref": "#/$defs/Target"},
+            {"type": "null"}
+          ]
         },
         "workspace": {
           "anyOf": [

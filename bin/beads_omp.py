@@ -148,8 +148,21 @@ class OmpExecution:
             return record
         return None
 
+    def adopt(self, run, intent, private):
+        from beads_adoption import adopt
+        return adopt(self, run, intent, private, read_json)
+
     def inspect(self, run, private):
         record = self.record(run, required=True)
+        evidence = private.get('adapter', {}).get('legacyAdoption')
+        if (evidence and evidence.get('fence') == run['fence']
+                and evidence.get('bindingId') == private['bindingId']):
+            from beads_adoption import observe
+            terminal, activity = observe(self, run, evidence)
+            if terminal != run['execution']['terminal']:
+                if activity == 'active':
+                    raise Refusal('terminal_mismatch', 'Adopted terminal changed outside the retained run.')
+            return activity
         lease = self.lease(record)
         terminal = run['execution']['terminal']
         if terminal:

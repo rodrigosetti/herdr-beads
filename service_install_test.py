@@ -14,6 +14,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent / "bin"))
 import beads_service_install as installer
+from beads_contract import Refusal
+from beads_identity import machine_id
 
 
 class ServiceInstallTests(unittest.TestCase):
@@ -105,6 +107,12 @@ class ServiceInstallTests(unittest.TestCase):
     def launch_calls(self):
         return [argv for argv, _, _ in self.calls if argv[0] == installer.LAUNCHCTL]
 
+    def identity_file(self, *, legacy=False, value="12345678-1234-4234-8234-123456789abc"):
+        path = self.paths.state_home / ("go-bd/machine-id" if legacy else "herdr-beads/machine-id")
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        installer.private_write(path, (value + "\n").encode())
+        return path
+
     def test_no_start_packages_absolute_paths_and_private_files_without_launchctl(self):
         root = self.project("project with spaces")
         self.install([root])
@@ -130,12 +138,16 @@ class ServiceInstallTests(unittest.TestCase):
         for path in (self.paths.root, self.paths.state, self.paths.state / "store", self.paths.logs):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
         self.assertTrue(os.access(self.paths.root / "bin/herdr-beads", os.X_OK))
+        identity = self.paths.state / "machine-id"
+        self.assertEqual(stat.S_IMODE(identity.stat().st_mode), 0o600)
+        self.assertFalse((self.paths.state_home / "go-bd").exists())
+        self.assertEqual(machine_id(state_home=self.paths.state_home), identity.read_text().strip())
 
     def test_reinstall_preserves_projects_identity_logs_and_state(self):
         first = self.project("first repository")
         second = self.project("second repository")
         self.install([first])
-        identity = self.paths.state_home / "go-bd/machine-id"
+        identity = self.paths.state / "machine-id"
         original_identity = identity.read_bytes()
         state = self.paths.state / "store/important.json"
         state.write_text("retained run state")
@@ -182,11 +194,125 @@ class ServiceInstallTests(unittest.TestCase):
 
     def test_invalid_machine_identity_never_replaced(self):
         self.install()
-        identity = self.paths.state_home / "go-bd/machine-id"
+        identity = self.paths.state / "machine-id"
         identity.write_text("bad identity\n")
         with self.assertRaisesRegex(installer.InstallError, "never replace"):
             self.install()
         self.assertEqual(identity.read_text(), "bad identity\n")
+        with self.assertRaisesRegex(installer.InstallError, "never replace"):
+            installer.manage("restart", self.paths)
+        self.assertEqual(self.launch_calls(), [])
+
+    def test_legacy_machine_identity_is_copied_without_regeneration_or_retirement(self):
+        legacy = self.identity_file(legacy=True)
+        original = legacy.read_bytes()
+        with patch.object(installer.uuid, "uuid4") as generate:
+            self.install()
+        generate.assert_not_called()
+        canonical = self.paths.state / "machine-id"
+        self.assertEqual(canonical.read_bytes(), original)
+        self.assertEqual(legacy.read_bytes(), original)
+        self.assertEqual(machine_id(state_home=self.paths.state_home), original.decode().strip())
+        legacy.unlink()
+        with patch.object(installer.uuid, "uuid4") as generate:
+            self.install()
+        generate.assert_not_called()
+        self.assertEqual(machine_id(state_home=self.paths.state_home), original.decode().strip())
+        self.assertEqual(canonical.read_bytes(), original)
+
+    def test_runtime_imports_legacy_machine_identity_and_survives_legacy_removal(self):
+        legacy = self.identity_file(legacy=True)
+        original = legacy.read_bytes()
+        with patch.dict(os.environ, {"XDG_STATE_HOME": str(self.paths.state_home)}):
+            self.assertEqual(machine_id(), original.decode().strip())
+            canonical = self.paths.state / "machine-id"
+            self.assertEqual(canonical.read_bytes(), original)
+            self.assertEqual(stat.S_IMODE(canonical.stat().st_mode), 0o600)
+            self.assertEqual(legacy.read_bytes(), original)
+            legacy.unlink()
+            self.assertEqual(machine_id(), original.decode().strip())
+
+    def test_interrupted_machine_import_never_publishes_an_incomplete_identity(self):
+        legacy = self.identity_file(legacy=True)
+        original = legacy.read_bytes()
+        canonical = self.paths.state / "machine-id"
+        actions = ((lambda: machine_id(state_home=self.paths.state_home), Refusal),
+                   (lambda: installer.ensure_machine(self.paths), OSError))
+        for action, error_type in actions:
+            for operation in ("fsync", "link"):
+                with self.subTest(action=action, operation=operation):
+                    with patch.object(installer.os, operation, side_effect=OSError("interrupted publication")):
+                        with self.assertRaises(error_type):
+                            action()
+                    self.assertFalse(canonical.exists())
+                    self.assertEqual(legacy.read_bytes(), original)
+                    self.assertEqual(list(self.paths.state.iterdir()), [])
+        installer.ensure_machine(self.paths)
+        self.assertEqual(canonical.read_bytes(), original)
+        self.assertEqual(machine_id(state_home=self.paths.state_home), original.decode().strip())
+
+    def test_machine_identity_conflict_refuses_both_records_untouched(self):
+        legacy = self.identity_file(legacy=True)
+        canonical = self.identity_file(value="87654321-4321-4321-8321-cba987654321")
+        original = {path: path.read_bytes() for path in (legacy, canonical)}
+        with self.assertRaisesRegex(installer.InstallError, "conflict"):
+            self.install(no_start=False)
+        with self.assertRaisesRegex(Refusal, "conflict"):
+            machine_id(state_home=self.paths.state_home)
+        self.assertEqual({path: path.read_bytes() for path in original}, original)
+        self.assertFalse(self.paths.config.exists())
+        self.assertEqual(self.launch_calls(), [])
+
+    def test_invalid_machine_identity_on_either_side_never_imports_or_replaces(self):
+        legacy = self.identity_file(legacy=True)
+        canonical = self.identity_file()
+        valid = legacy.read_bytes()
+        for invalid in (legacy, canonical):
+            with self.subTest(path=invalid):
+                installer.private_write(legacy, valid)
+                installer.private_write(canonical, valid)
+                invalid.write_text("invalid established identity\n")
+                original = {path: path.read_bytes() for path in (legacy, canonical)}
+                with self.assertRaisesRegex(installer.InstallError, "never replace"):
+                    self.install()
+                with self.assertRaisesRegex(Refusal, "never replace"):
+                    machine_id(state_home=self.paths.state_home)
+                self.assertEqual({path: path.read_bytes() for path in original}, original)
+        canonical.unlink()
+        legacy.write_text("invalid legacy identity\n")
+        with self.assertRaises(installer.InstallError):
+            self.install()
+        with self.assertRaises(Refusal):
+            machine_id(state_home=self.paths.state_home)
+        self.assertFalse(canonical.exists())
+
+    def test_missing_established_machine_identity_is_never_regenerated_on_install_or_restart(self):
+        self.install()
+        canonical = self.paths.state / "machine-id"
+        canonical.unlink()
+        with patch.object(installer.uuid, "uuid4") as generate:
+            with self.assertRaisesRegex(installer.InstallError, "missing.*never replace"):
+                self.install(no_start=False)
+            with self.assertRaisesRegex(installer.InstallError, "missing.*never replace"):
+                installer.manage("restart", self.paths)
+        generate.assert_not_called()
+        with self.assertRaisesRegex(Refusal, "restore"):
+            machine_id(state_home=self.paths.state_home)
+        self.assertFalse(canonical.exists())
+        self.assertEqual(self.launch_calls(), [])
+
+    def test_runtime_never_creates_a_fresh_machine_identity(self):
+        with self.assertRaisesRegex(Refusal, "restore"):
+            machine_id(state_home=self.paths.state_home)
+        self.assertFalse(self.paths.state.exists())
+
+    def test_legacy_state_without_identity_is_not_a_fresh_install(self):
+        (self.paths.state_home / "go-bd").mkdir(parents=True)
+        with patch.object(installer.uuid, "uuid4") as generate:
+            with self.assertRaisesRegex(installer.InstallError, "missing.*never replace"):
+                self.install()
+        generate.assert_not_called()
+        self.assertFalse((self.paths.state / "machine-id").exists())
 
     def test_missing_required_tool_fails_before_provisioning(self):
         (self.tools / "bd").unlink()

@@ -57,7 +57,7 @@ Defaults:
 - Runtime health: the same directory's `service-status.json`; persistent store: `store`; socket: `controller.sock`.
 - Logs: the same directory's `logs/stdout.log` and `logs/stderr.log`.
 - LaunchAgent: `~/Library/LaunchAgents/com.herdr.beads.plist`.
-- Stable existing-or-created machine identity: `${XDG_STATE_HOME:-~/.local/state}/go-bd/machine-id`; an invalid identity is refused, never replaced.
+- Stable machine identity: `${XDG_STATE_HOME:-~/.local/state}/herdr-beads/machine-id`, imported unchanged from `go-bd/machine-id` when present. Both files are retained; conflicting/invalid identities refuse startup.
 
 Service/config/store/log directories are owner-only; config, plist, and logs are 0600. The plist contains only explicit `HOME`, `USER`, `LOGNAME`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `HERDR_APP_HOME`, and a bounded executable-directory/system PATH; inherited `BEADS_DIR` and secrets are excluded. `status` prints config, health, log, socket, and store paths, optional capability gaps, launchctl state, and runtime health; launchctl or health errors remain visible and return nonzero. For direct launchd diagnostics:
 
@@ -169,7 +169,7 @@ The version-1 controller includes a private JSON run store, concrete omp executi
 
 `request --socket /absolute/path/controller.sock` selects an isolated socket; default: `${XDG_STATE_HOME:-~/.local/state}/herdr-beads/controller.sock`. The socket parent must be owner-only (0700); the socket is 0600. The service accepts only local same-user peers on macOS/Linux and only versioned, validated run-scoped operations—not arbitrary commands or remote execution. Request/response limits are 1 MiB / 4 MiB, with a five-second client deadline. Exit codes: 0 for `ok`/`accepted`, 2 for `refused`, 1 for transport/dependency/IO errors. A timeout/disconnect is **not cancellation**: reuse the same request ID/payload or inspect status before acting. `bin/herdr-beads serve` is the low-level injectable transport, not the installed periodic scheduler; do not run competing owners on the installed socket.
 
-The controller adopts the existing `go-bd/machine-id`; a missing/invalid identity refuses service startup rather than generating a replacement. Repository identity is the canonical checkout plus Git common directory, independently resolved canonical Beads directory, full issue ID, and machine. Linked worktrees resolve to the canonical source checkout; a clone-backed workspace needs the provider's independent registry/source validation.
+The controller retains the existing machine UUID independently of the retired launcher's name in `herdr-beads/machine-id`. Import uses fsynced, exclusive atomic publication; it never replaces an existing identity. Both canonical and legacy files are checked while present; a missing/invalid established identity or disagreement refuses startup. Only a genuinely fresh service install may create a UUID. Repository identity is the canonical checkout plus Git common directory, independently resolved canonical Beads directory, full issue ID, and machine. Linked worktrees resolve to the canonical source checkout; a clone-backed workspace needs the provider's independent registry/source validation.
 
 ### Versioned requests and independent state
 
@@ -190,11 +190,12 @@ The complete wire shapes live in `schemas/v1/{controller,run,adapter}.schema.jso
 }
 ```
 
-Mutations carry `expected:{fence:{runId,attempt,generation},revision}`; only the first `start_or_focus` uses `expected:null`. Start additionally declares `harness:"omp"`, an explicit target, `newAttempt:false`, and `policy:{closeAfterIntegration:false,cleanupAfterRelease:false}`. Either policy set to true is refused. No request enables closure, push, fetch, merge, or resource deletion.
+Mutations carry `expected:{fence:{runId,attempt,generation},revision}`; the first `start_or_focus` or `adopt_legacy` uses `expected:null`. A new start declares `harness:"omp"`, an explicit target, `newAttempt:false`, and `policy:{closeAfterIntegration:false,cleanupAfterRelease:false}`. Either policy set to true is refused. No request enables closure, push, fetch, merge, or resource deletion.
 
 | Method | Effect |
 |---|---|
 | `status` | Current or retained run, latest durable operation, supported capabilities and action refusals; saved observations are timestamped, not a fresh authority check |
+| `adopt_legacy` | Journal adoption of already self-owned in-progress omp history; validate exact session and independent workspace, focus live owner without launching; no claim or destination inference |
 | `start_or_focus` | Reserve one eligible attempt, focus a validated live owner, or exact-resume an inactive writable session; no fallback conversation |
 | `resume` | Exact saved conversation, new generation/binding; explicit read-only access requires current integration and adapter enforcement |
 | `handoff` | Immutable source revisions, complete required set, exact workspace HEAD, summary/next steps/risks; neither release nor merge |
@@ -221,6 +222,7 @@ Each external step is journaled before execution and its observed receipt commit
 
 - Execution declares `capabilities`: `launch`, `exact_resume`, `durable_identity`, `owner_activity`, `structured_handoff`, `explicit_release`, `read_only`. Missing capability/harness returns a structured refusal before unsafe work.
 - Workspace `plan(run)` is read-only and returns the exact schema `Workspace` to journal before allocation; `validate(run)` checks the recorded provider/backing/source/registry identity. Git path/common-dir/branch checks also run in the controller.
+- Legacy adoption uses read-only `execution.adopt(run, intent, private)` for a neutral session/terminal/activity plus private evidence, then independent `workspace.adopt(run, recordedPath)` for actual provider/backing/source/branch identity. The journal's `adopt` step is replayable without launching; only a validated live result schedules focus.
 - Execution/workspace implement `perform(step, run, intent, private)` and read-only `recover(...)`. Steps are `workspace`, `launch`, `resume`, `focus`, `release`, `read_only`; Beads claim is the controller authority's own step. `intent` supplies the operation ID, fence and journal position; private state supplies the planned workspace, scoped binding/credential, sequence, and adapter-owned association.
 - A receipt is `{"workspace": Workspace}` or `{"observation": Observation}` as appropriate; focus completes only after the adapter verifies/focuses the exact live owner. Unknown outcomes return null. Optional `receipt.private` merges into the adapter-owned private association, including when a matching callback raced its receipt.
 - `validate_observation(run, observation, private)` independently verifies actual durable session/terminal/workspace/ownership and acknowledgements without effects. Optional `publish_observation(...)` runs only after policy accepts the validated event, before acknowledging the request; the omp adapter uses it for field-preserving canonical session mirroring. JSON shape or callback credential alone is insufficient proof. The controller validates fence, binding, event ID and monotonic sequence; secrets/transcript paths never appear in public run/operation responses.
@@ -231,6 +233,19 @@ Each external step is journaled before execution and its observed receipt commit
 Before terminal creation, the adapter fsyncs an owner-only per-run/generation startup config and initial task outside the workspace under `${XDG_STATE_HOME:-~/.local/state}/herdr-beads/omp`. An interrupted or slow Herdr request reconnects by the exact `GO_BD_SESSION_CONFIG` value in the terminal's immutable creation argv, including the creation-to-labeling gap. Recovery never issues another terminal creation request. Unconfirmed operations retain their claims, workspace, transcript and terminal for inspection.
 
 Start/focus/resume recheck the canonical database, owner, blockers and workspace identity. Focus requires the acknowledged foreground omp PID and exact transcript lease, not a title or stale agent report. Ended terminals resume only the recorded absolute transcript with `--resume`, no fresh task or `--restore`; missing, foreign, conflicting or leased history refuses intact. Existing legacy associations require explicit adoption rather than a new-run overwrite.
+
+### Legacy adoption
+
+Send `method:"adopt_legacy", params:{"expected":null}` with the same canonical scope as `status`. Adoption records intent before inspecting legacy state; restart repeats read-only reconciliation rather than launching. Completion retains the concrete omp evidence privately and records the neutral session/workspace result before any later cutover. No legacy JSON, transcript, lease, Beads metadata, branch, registry or machine-ID file is retired or rewritten. The legacy issue lock serializes observation with an in-flight old launch.
+
+Sources are the exact `metadata.omp_session`, per-database `go-bd/<sha256(beadsDir)>/issue-<full-id>.json`, original launch config/ack, terminal creation argv, canonical `beads.project`/`beads.issue` labels, foreground omp PID, exact transcript lease, and independently validated omp workspace registry/Git backing. A live terminal requires agreement among these identities, not merely generic Herdr labels, a title or a recent transcript. Conflicting, malformed, foreign-machine, missing or orphaned resources refuse visibly and remain retained for explicit resolution. Malformed launch files in the project's legacy state conservatively block adoption even when their issue cannot be determined.
+
+An adopted live run focuses its existing terminal; repeating adoption focuses the same incarnation. An ended, unleased exact conversation is adopted stopped, without creating a terminal. A subsequent `resume` or `start_or_focus` reopens only the original transcript/workspace, without a fresh prompt. Repeated `adopt_legacy` on a retained inactive run uses that same exact-resume path. Original branch names and actual linked/clone backing are preserved; new workspace planning keeps its stricter issue/attempt naming checks.
+
+Adopted runs start with `target:null`, no submissions/evidence, held release and `manual_cleanup_required`. Use `target:null` and the retained policy when focusing/resuming an unbound run with `start_or_focus`; null is refused for new attempts. Explicit `handoff` supplies mode/target and exact required submissions. Neither a remote nor a branch name chooses local-target versus PR mode. Adoption cannot produce merge proof, a manual closure command or cleanup permission.
+
+Observed adoption validation (2026-11-09): two actual CLI/socket requests adopted/focused the running omp conversation `01a1c269-5da9-710c-a5b4-7f86278ef4b9` in terminal `t2n` using an isolated controller store. Transcript bytes, legacy JSON and the terminal set were unchanged; canonical linked backing and original branch were validated, and destination remained null. This is live adoption proof, not installed cutover or managed-PR integration acceptance.
+
 
 Workspace planning preserves the explicit integration target and branches new work from its already-local ref; no remote, fetch, push, PR creation or merge is required for local-target mode. Registry/source/common-dir/branch checks distinguish independent clones from linked workspaces; clone origin never selects the integration destination. Omp 18.17's copy-on-write “clone” provisioning still registers linked Git worktrees. Supported config queries can initialize omp settings storage, and `omp worktree add` runs the user's existing checkout hooks; the adapter itself issues no network or integration commands.
 

@@ -206,27 +206,47 @@ def register_project(value, executables, environment):
     return {"repository": {"root": str(root), "commonDir": str(common)}, "beadsDir": str(beads)}
 
 
-def ensure_machine(paths):
-    directory = paths.state_home / "go-bd"
-    private_directory(directory)
-    path = directory / "machine-id"
-    if path.exists() or path.is_symlink():
+def ensure_machine(paths, *, fresh=False):
+    """Import the legacy UUID without replacing either established record."""
+    canonical = paths.state / "machine-id"
+    legacy = paths.state_home / "go-bd/machine-id"
+    identities = {}
+    for path in (canonical, legacy):
+        if not path.exists() and not path.is_symlink():
+            continue
         try:
             value = private_read(path).decode().strip()
             if str(uuid.UUID(value)) != value:
                 raise ValueError("noncanonical UUID")
         except (ValueError, UnicodeError) as error:
             raise InstallError(f"Invalid machine identity; restore original, never replace: {path}") from error
+        identities[path] = value
+    if len(set(identities.values())) > 1:
+        raise InstallError("Canonical and legacy machine identities conflict; restore original files, never replace either")
+    if canonical in identities:
         return
-    # Exclusive creation never replaces an identity created concurrently.
+    if not identities and not fresh:
+        raise InstallError(f"Established machine identity is missing; restore original, never replace: {canonical}")
+    value = next(iter(identities.values())) if identities else str(uuid.uuid4())
+    private_directory(paths.state)
+    descriptor, temporary = tempfile.mkstemp(prefix=".machine-id.", dir=canonical.parent)
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return ensure_machine(paths)
-    with os.fdopen(descriptor, "w") as stream:
-        stream.write(str(uuid.uuid4()) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(value + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Publish only the complete file, without replacing a concurrent identity.
+        try:
+            os.link(temporary, canonical)
+        except FileExistsError:
+            return ensure_machine(paths)
+        directory = os.open(canonical.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        os.unlink(temporary)
 
 
 def package_sources(source, paths):
@@ -348,6 +368,8 @@ def diagnostics(paths, config):
 
 
 def install(source, paths, projects, no_start):
+    established = any(path.exists() or path.is_symlink() for path in (
+        paths.state, paths.root, paths.plist, paths.state_home / "go-bd"))
     previous = load_config(paths) if paths.config.exists() or paths.config.is_symlink() else None
     executables = discover_executables()
     environment = service_environment(paths, executables)
@@ -367,9 +389,9 @@ def install(source, paths, projects, no_start):
               "socketPath": str(paths.state / "controller.sock"), "storeRoot": str(paths.state / "store"),
               "executables": executables, "projects": registered}
     validate_config(config, paths)
+    ensure_machine(paths, fresh=not established)
     for directory in (paths.state, paths.state / "store", paths.logs):
         private_directory(directory)
-    ensure_machine(paths)
     package_sources(source.resolve(), paths)
     provision_python(paths)
     private_write(paths.config, (json.dumps(config, indent=2) + "\n").encode())
@@ -408,6 +430,7 @@ def manage(action, paths):
         launchctl("bootout", paths)
         print("Stopped. Run restart to load the service again.")
     elif action == "restart":
+        ensure_machine(paths)
         start(paths, plist["EnvironmentVariables"])
     else:
         errors = []

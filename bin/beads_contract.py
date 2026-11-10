@@ -55,7 +55,10 @@ def validate_run(run):
     def submission_key(identity):
         return (identity['submissionId'], identity['submissionRevision'])
 
-    if run['target']['mode'] != 'github-pr' and run['target']['repository'] != run['scope']['repository']:
+    if run['target'] is None:
+        if run['submissions'] or run['coverage']['required'] or run['coverage']['state'] != 'unsubmitted':
+            invalid('Unbound runs cannot carry submissions or integration evidence.')
+    elif run['target']['mode'] != 'github-pr' and run['target']['repository'] != run['scope']['repository']:
         invalid('Run target does not identify its canonical repository.')
     submissions = {}
     for submission in run['submissions']:

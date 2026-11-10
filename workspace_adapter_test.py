@@ -207,6 +207,121 @@ class WorkspaceAdapterTests(unittest.TestCase):
         self.registry[0]['parentRepo'] = str(self.home / 'another-repository')
         self.assert_refusal('workspace_mismatch', lambda: self.provider.validate(self.run))
 
+
+    def test_explicit_linked_adoption_preserves_branch_without_target_or_effects(self):
+        path = self.home / 'recorded-legacy-location'
+        branch = 'feature/original-session'
+        git(self.repo, 'worktree', 'add', '-b', branch, str(path))
+        self.registry = [{'path': str(path), 'parentRepo': str(self.repo), 'branch': branch}]
+        self.run['target'] = None
+        self.base_setting = str(self.home / 'must-not-infer-destination')
+        before = git(self.repo, 'show-ref')
+        registry = copy.deepcopy(self.registry)
+        workspace = self.provider.adopt(self.run, str(path))
+        self.assertEqual(workspace, {'provider': 'omp-worktree', 'backing': 'linked',
+            'path': str(path), 'branchRef': f'refs/heads/{branch}',
+            'sourceRepository': self.source, 'commonDir': self.source['commonDir']})
+        self.run['workspace'] = workspace
+        self.assertEqual(self.provider.validate(self.run), workspace)
+        self.assertIsNone(self.run['target'])
+        self.assertEqual(git(self.repo, 'show-ref'), before)
+        self.assertEqual(self.registry, registry)
+        self.assertEqual(self.add_calls, 0)
+        self.registry = []
+        self.assert_refusal('workspace_mismatch', lambda: self.provider.validate(self.run))
+        self.registry = registry
+        git(path, 'checkout', '-b', 'changed-after-adoption')
+        self.assert_refusal('workspace_mismatch', lambda: self.provider.validate(self.run))
+
+    def test_explicit_clone_adoption_requires_registry_and_ignores_origin(self):
+        path = self.home / 'retained-independent-clone'
+        git(self.home, 'clone', '--no-hardlinks', str(self.repo), str(path))
+        git(path, 'checkout', '-b', 'historical-branch')
+        self.run['target'] = None
+        self.assert_refusal('workspace_mismatch', lambda: self.provider.adopt(self.run, str(path)))
+        self.registry = [{'path': str(path), 'parentRepo': str(self.repo), 'branch': 'historical-branch'}]
+        git(path, 'remote', 'set-url', 'origin', 'https://unrelated.invalid/not-authority')
+        workspace = self.provider.adopt(self.run, str(path))
+        self.assertEqual(workspace['backing'], 'clone')
+        self.assertEqual(workspace['commonDir'], str(path / '.git'))
+        self.assertEqual(workspace['branchRef'], 'refs/heads/historical-branch')
+        self.run['workspace'] = workspace
+        self.assertEqual(self.provider.validate(self.run), workspace)
+        self.assertEqual(self.add_calls, 0)
+        self.assertFalse(any('fetch' in argv or 'push' in argv or 'merge' in argv for argv in self.calls))
+        exact = self.registry[0]
+        for rows in ([exact, exact], [dict(exact, orphanReason='missing parent')],
+                     [dict(exact, parentRepo=str(self.home))]):
+            self.registry = rows
+            self.assert_refusal('workspace_mismatch', lambda: self.provider.adopt(self.run, str(path)))
+
+    def test_adoption_refuses_unregistered_or_conflicting_linked_workspace(self):
+        path = self.home / 'linked-legacy'
+        git(self.repo, 'worktree', 'add', '-b', 'legacy-branch', str(path))
+        self.run['target'] = None
+        exact = {'path': str(path), 'parentRepo': str(self.repo), 'branch': 'legacy-branch'}
+        variants = ([], [dict(exact, orphanReason='missing parent')], [dict(exact, orphanReason='')],
+                    [dict(exact, kind='orphaned')], [dict(exact, branch='wrong')],
+                    [dict(exact, parentRepo=str(self.home))], [dict(exact, parentRepo=None)],
+                    [exact, exact], [exact, dict(exact, branch='wrong')])
+        before = git(self.repo, 'show-ref')
+        for rows in variants:
+            with self.subTest(rows=rows):
+                self.registry = copy.deepcopy(rows)
+                self.assert_refusal('workspace_mismatch', lambda: self.provider.adopt(self.run, str(path)))
+                self.assertEqual(self.registry, rows)
+        self.assertEqual(git(self.repo, 'show-ref'), before)
+        self.assertEqual(self.add_calls, 0)
+
+    def test_linked_adoption_independently_checks_git_worktree_registration(self):
+        path = self.home / 'linked-legacy'
+        git(self.repo, 'worktree', 'add', '-b', 'legacy-branch', str(path))
+        self.registry = [{'path': str(path), 'parentRepo': str(self.repo), 'branch': 'legacy-branch'}]
+        self.run['target'] = None
+
+        def without_git_registration(argv, run, **kwargs):
+            if argv == ['git', 'worktree', 'list', '--porcelain', '-z']:
+                return ''
+            return self.cli(argv, run, **kwargs)
+        with patch.object(self.provider, '_command', side_effect=without_git_registration):
+            self.assert_refusal('workspace_mismatch', lambda: self.provider.adopt(self.run, str(path)))
+        self.assertEqual(self.add_calls, 0)
+
+    def test_adoption_requires_recorded_canonical_path_and_never_selects_registry_candidate(self):
+        path = self.home / 'linked-legacy'
+        git(self.repo, 'worktree', 'add', '-b', 'legacy-branch', str(path))
+        self.registry = [{'path': str(path), 'parentRepo': str(self.repo), 'branch': 'legacy-branch'}]
+        self.run['target'] = None
+        alias = self.home / 'alias'
+        alias.symlink_to(path, target_is_directory=True)
+        for value in (None, '', 'linked-legacy', str(alias)):
+            with self.subTest(value=value):
+                self.assert_refusal('workspace_mismatch', lambda: self.provider.adopt(self.run, value))
+        self.assert_refusal('workspace_missing', lambda: self.provider.adopt(self.run, str(self.home / 'missing')))
+        self.assert_refusal('workspace_missing', lambda: self.provider.adopt(self.run, str(path / 'source')))
+        self.assertEqual(self.add_calls, 0)
+
+    def test_adoption_does_not_relax_issue_branch_checks_for_new_plans(self):
+        path = self.home / '.omp/wt/test-1'
+        path.parent.mkdir(parents=True)
+        git(self.repo, 'worktree', 'add', '-b', 'historical-branch', str(path))
+        self.registry = [{'path': str(path), 'parentRepo': str(self.repo), 'branch': 'historical-branch'}]
+        workspace = self.provider.adopt(self.run, str(path))
+        self.assert_refusal('workspace_mismatch', lambda: self.provider.plan(self.run))
+        private = {'plannedWorkspace': workspace}
+        self.assert_refusal('workspace_mismatch', lambda: self.provider.recover('workspace', self.run, {}, private))
+        self.assertEqual(git(path, 'symbolic-ref', 'HEAD'), 'refs/heads/historical-branch')
+        self.assertEqual(self.add_calls, 0)
+
+    def test_adoption_revalidates_canonical_source_not_registry_alone(self):
+        path = self.home / 'linked-legacy'
+        git(self.repo, 'worktree', 'add', '-b', 'legacy-branch', str(path))
+        self.registry = [{'path': str(path), 'parentRepo': str(self.repo), 'branch': 'legacy-branch'}]
+        self.run['target'] = None
+        self.run['scope']['repository']['commonDir'] = str(self.home)
+        self.assert_refusal('repository_mismatch', lambda: self.provider.adopt(self.run, str(path)))
+        self.assertEqual(self.add_calls, 0)
+
     def test_registry_or_backing_identity_changes_are_refused(self):
         workspace, private = self.provision()
         self.registry[0]['orphanReason'] = 'parent repo missing'

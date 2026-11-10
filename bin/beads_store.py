@@ -254,7 +254,7 @@ class Store:
             steps = intent.get("steps")
             if (set(intent) != {"steps", "index", "started"}
                     or not isinstance(steps, list) or not steps
-                    or any(not isinstance(step, str) or step not in {"claim", "workspace", "launch", "resume", "focus", "release", "reconcile", "read_only"} for step in steps)
+                    or any(not isinstance(step, str) or step not in {"adopt", "claim", "workspace", "launch", "resume", "focus", "release", "reconcile", "read_only"} for step in steps)
                     or type(intent.get("index")) is not int or not 0 <= intent["index"] <= len(steps)
                     or type(intent.get("started")) is not bool
                     or (public["state"] in ("pending", "running") and intent["index"] == len(steps))):

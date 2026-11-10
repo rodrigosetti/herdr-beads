@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 import uuid
 
 from beads_contract import Refusal, now, validate
@@ -46,17 +47,55 @@ def command(argv, cwd, *, env=None, timeout=3):
     return result.stdout.strip()
 
 
-def machine_id():
-    path = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'go-bd/machine-id'
-    try:
-        value = path.read_text().strip()
-    except OSError as error:
-        raise Refusal('unknown_machine', f'Existing machine identity unavailable: {path}; restore it, do not replace it.') from error
-    try:
-        if str(uuid.UUID(value)) != value:
-            raise ValueError('noncanonical machine identity')
-    except (ValueError, AttributeError) as error:
-        raise Refusal('unknown_machine', f'Invalid machine identity: {path}; restore the original file.') from error
+def machine_id(*, state_home=None):
+    """Retain the historical UUID under the launcher-independent state path.
+
+    Startup may copy a valid legacy identity, but never generates or replaces
+    one. Both records are checked before any write; conflicts require repair.
+    """
+    root = Path(state_home) if state_home is not None else Path(
+        os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state'))
+    canonical = root / 'herdr-beads/machine-id'
+    legacy = root / 'go-bd/machine-id'
+    identities = {}
+    for path in (canonical, legacy):
+        if not path.exists() and not path.is_symlink():
+            continue
+        try:
+            value = path.read_text().strip()
+            if str(uuid.UUID(value)) != value:
+                raise ValueError('noncanonical machine identity')
+        except (OSError, ValueError, UnicodeError) as error:
+            raise Refusal('unknown_machine', f'Invalid machine identity: {path}; restore the original file, never replace it.') from error
+        identities[path] = value
+    if not identities:
+        raise Refusal('unknown_machine', f'Existing machine identity unavailable: {canonical}; restore it, do not replace it.')
+    if len(set(identities.values())) != 1:
+        raise Refusal('unknown_machine', 'Canonical and legacy machine identities conflict; restore the original files, never replace them.')
+    value = next(iter(identities.values()))
+    if canonical not in identities:
+        try:
+            canonical.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            descriptor, temporary = tempfile.mkstemp(prefix='.machine-id.', dir=canonical.parent)
+            try:
+                with os.fdopen(descriptor, 'w') as stream:
+                    stream.write(value + '\n')
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                # Publish only the complete file, without replacing a concurrent identity.
+                try:
+                    os.link(temporary, canonical)
+                except FileExistsError:
+                    return machine_id(state_home=root)
+                directory = os.open(canonical.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            finally:
+                os.unlink(temporary)
+        except OSError as error:
+            raise Refusal('unknown_machine', f'Cannot retain machine identity: {canonical}; legacy file is preserved.') from error
     return value
 
 

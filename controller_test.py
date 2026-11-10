@@ -121,6 +121,42 @@ class Execution:
             raise Refusal('session_mismatch', 'not actual durable session')
 
 
+class LegacyExecution(Execution):
+    def __init__(self, directory):
+        super().__init__(directory)
+        self.active = True
+        self.focuses = 0
+        self.interrupt_adoption = False
+        self.adoption_error = None
+
+    def adopt(self, run, intent, private):
+        if self.interrupt_adoption:
+            raise SystemExit('interrupted after durable adoption intent')
+        if self.adoption_error:
+            raise Refusal('session_mismatch', self.adoption_error)
+        return {'workspacePath': str(self.directory / 'workspace'),
+                'session': {'harness': 'omp', 'sessionId': 'actual-session', 'bindingId': private['bindingId']},
+                'terminal': {'machineId': run['scope']['machineId'], 'address': 'legacy-terminal',
+                             'spaceId': None, 'tabId': None} if self.active else None,
+                'activity': 'active' if self.active else 'inactive',
+                'private': {'preservedHistory': 'exact-adapter-identity'}}
+
+    def inspect(self, run, private):
+        return 'active' if self.active else 'inactive'
+
+    def perform(self, step, run, intent, private):
+        if step == 'focus':
+            self.focuses += 1
+        return super().perform(step, run, intent, private)
+
+
+class LegacyWorkspace(Workspace):
+    def adopt(self, run, path):
+        if path != str(self.path):
+            raise Refusal('workspace_mismatch', 'different retained workspace')
+        return self.plan(run)
+
+
 class LifecycleTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -203,6 +239,93 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(result['outcome'], 'accepted', result)
         self.drain()
         return self.status()['run']
+
+    def legacy(self, active=True):
+        git(self.repo, 'worktree', 'add', '-b', 'task', str(self.workspace.path))
+        self.workspace = LegacyWorkspace(self.repo, self.workspace.path)
+        self.execution = LegacyExecution(self.home)
+        self.execution.active = active
+        self.authority.row.update(status='in_progress', assignee='owner')
+        self.controller = self.restart()
+        return self.request('adopt_legacy', {'expected': None})
+
+    def test_live_adoption_restart_and_repeated_focus_preserve_one_unbound_run(self):
+        request = self.legacy()
+        before = copy.deepcopy(self.authority.row)
+        self.assertEqual(self.controller.handle(request)['outcome'], 'accepted')
+        self.execution.interrupt_adoption = True
+        with self.assertRaises(SystemExit):
+            self.controller.work_once()
+        self.assertEqual(self.status()['operation']['state'], 'running')
+        self.execution.interrupt_adoption = False
+        self.controller = self.restart()
+        self.drain()
+        run = self.status()['run']
+        self.assertIsNone(run['target'])
+        self.assertEqual(run['execution']['session']['sessionId'], 'actual-session')
+        first_id = run['fence']['runId']
+        repeated = self.call('adopt_legacy', {'expected': self.condition()})
+        self.assertEqual(repeated['outcome'], 'accepted', repeated)
+        self.drain()
+        self.assertEqual(self.status()['run']['fence']['runId'], first_id)
+        self.assertEqual(self.execution.focuses, 2)
+        self.assertEqual(self.execution.launches, 0)
+        self.assertEqual(self.authority.row, before)
+        doc = self.store.read(self.scope)
+        self.assertEqual(len(doc['runs']), 1)
+        self.assertEqual([e['kind'] for e in doc['audit']], ['adoption_intent', 'adoption_result'])
+        self.assertEqual(run['coverage']['state'], 'unsubmitted')
+        self.assertIsNone(self.reconcile()['closure']['manualCommand'])
+
+    def test_inactive_adoption_resumes_same_session_without_binding_destination(self):
+        request = self.legacy(active=False)
+        git(self.repo, 'remote', 'add', 'origin', 'https://github.com/example/not-integration-evidence.git')
+        self.assertEqual(self.controller.handle(request)['outcome'], 'accepted')
+        self.drain()
+        run = self.status()['run']
+        self.assertEqual(run['execution']['state'], 'stopped')
+        self.assertEqual(self.execution.launches, 0)
+        response = self.call('start_or_focus', {'expected': self.condition(), 'harness': 'omp',
+            'target': None, 'policy': run['policy'], 'newAttempt': False})
+        self.assertEqual(response['outcome'], 'accepted', response)
+        self.drain()
+        resumed = self.status()['run']
+        self.assertEqual(resumed['execution']['session']['sessionId'], run['execution']['session']['sessionId'])
+        self.assertEqual(resumed['fence']['runId'], run['fence']['runId'])
+        self.assertEqual(resumed['fence']['generation'], 2)
+        self.assertIsNone(resumed['target'])
+        self.assertEqual(self.execution.launches, 1)
+        self.assertEqual(resumed['cleanup']['state'], 'held')
+
+    def test_conflicting_adoption_remains_visible_and_retry_retains_attempt(self):
+        request = self.legacy()
+        self.execution.adoption_error = 'conflicting exact receipts'
+        self.controller.handle(request)
+        self.drain()
+        failed = self.status()
+        self.assertEqual(failed['operation']['error']['code'], 'session_mismatch')
+        self.assertIsNone(failed['run']['execution']['session'])
+        self.assertEqual(self.execution.launches, 0)
+        self.execution.adoption_error = None
+        result = self.call('adopt_legacy', {'expected': self.condition()})
+        self.assertEqual(result['outcome'], 'accepted', result)
+        self.drain()
+        self.assertEqual(self.status()['run']['fence']['runId'], failed['run']['fence']['runId'])
+        self.assertEqual(len(self.store.read(self.scope)['operations']), 2)
+
+    def test_adoption_without_destination_requires_explicit_handoff_for_evidence(self):
+        request = self.legacy()
+        self.assertEqual(self.controller.handle(request)['outcome'], 'accepted')
+        self.drain()
+        run = self.reconcile()
+        self.assertIsNone(run['target'])
+        self.assertEqual(run['coverage']['required'], [])
+        self.assertEqual(run['release']['state'], 'held')
+        self.assertEqual(run['cleanup']['blockers'], ['manual_cleanup_required'])
+        self.assertIsNone(run['closure']['manualCommand'])
+        identity = self.handoff()
+        self.assertEqual(self.status()['run']['target'], identity['target'])
+        self.assertEqual(self.status()['run']['coverage']['state'], 'pending')
 
     def test_concurrent_starts_reserve_exactly_one_active_attempt(self):
         barrier = threading.Barrier(3)
