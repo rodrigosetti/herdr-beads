@@ -22,6 +22,7 @@ mkdir -p "$bin_home"
 cp -f "$source_dir/bin/go-bd" "$bin_home/go-bd"
 cp -f "$source_dir/bin/go-bd-session.mjs" "$bin_home/go-bd-session.mjs"
 cp -f "$source_dir/bin/beads_epics.py" "$bin_home/beads_epics.py"
+cp -f "$source_dir/bin/beads_presentation.py" "$bin_home/beads_presentation.py"
 chmod +x "$bin_home/go-bd"
 mkdir -p "$app_home/layouts"
 if [[ ! -e "$app_home/layouts/beads-workspace.json" ]]; then

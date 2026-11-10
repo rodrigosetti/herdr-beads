@@ -40,7 +40,7 @@ class AdoptionHosting(HerdrHosting):
         self.focused.append(args['terminal'])
         return {}
 
-    def start(self, run, argv):
+    def start(self, run, argv, *, issue):
         self.starts.append(argv)
 
     def find_operation(self, run, path, *, address=None):
@@ -67,7 +67,7 @@ class LegacyAdoptionTests(unittest.TestCase):
         self.transcript.write_text(json.dumps({'type': 'session_title', 'title': 'Not identity'}) + '\n'
                                    + json.dumps({'type': 'session', 'id': 'exact-session', 'cwd': str(self.worktree)})
                                    + '\n' + json.dumps({'type': 'message', 'message': {'role': 'user', 'content': 'Retain all history'}}) + '\n')
-        self.authority = Authority({'id': 'task-1', 'status': 'in_progress',
+        self.authority = Authority({'id': 'task-1', 'title': 'Original title', 'status': 'in_progress',
                                     'metadata': {'omp_session': self.record, 'unrelated': {'keep': True}}})
         self.hosting = AdoptionHosting()
         self.adapter = OmpExecution(self.authority, self.hosting, self.root / 'controller-omp')

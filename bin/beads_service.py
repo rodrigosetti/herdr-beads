@@ -15,7 +15,9 @@ import uuid
 from beads_contract import Refusal, now, validate
 from beads_controller import Controller
 from beads_epics import observe_epics
+from beads_herdr import HerdrHosting
 from beads_identity import Authority, canonical_path, configure_executables, machine_id
+from beads_presentation import reconcile_project_spaces, reconcile_space_names
 from beads_store import Store
 from beads_transport import ControllerServer, TransportError
 
@@ -87,11 +89,12 @@ class Project:
 
     def __init__(self, authority, scope):
         self.authority, self.scope = authority, scope
+        self.beads = scope.get('beadsDir')
 
     def bd(self, *args):
-        # Defense in depth: the background epic observer gets reads only.
+        # Defense in depth: background project observers get reads only.
         if not args or args[0] not in ('list', 'show'):
-            raise Refusal('unsupported_capability', 'Background epic observation is read-only.')
+            raise Refusal('unsupported_capability', 'Background project observation is read-only.')
         return self.authority.bd(self.scope, *args)
 
 
@@ -100,27 +103,60 @@ class LifecycleServer(ControllerServer):
         super().__init__(controller, config['socketPath'])
         self.config = config
         self.health_path = Path(health_path)
+        self.hosting = HerdrHosting(executables=config['executables'])
         self.health = {'schemaVersion': 1, 'state': 'starting', 'pid': os.getpid(),
                        'startedAt': now(), 'lastReconcileAt': None, 'pollSeconds': config['pollSeconds'],
                        'socketPath': config['socketPath'], 'storeRoot': config['storeRoot'],
                        'support': controller.support(), 'projects': [], 'runs': [], 'errors': []}
 
     def _projects(self):
+        scopes = self.controller.store.documents()
         projects = {json.dumps(p, sort_keys=True): p for p in self.config['projects']}
-        for scope in self.controller.store.documents():
+        for scope in scopes:
             if scope['machineId'] == self.controller.machine_id:
                 project = {k: scope[k] for k in ('repository', 'beadsDir')}
                 projects[json.dumps(project, sort_keys=True)] = project
         result = []
         for project in projects.values():
             scope = {**project, 'issueId': 'service-project', 'machineId': self.controller.machine_id}
-            row = copy.deepcopy(project)
+            row = {**copy.deepcopy(project), 'errors': [], 'renamedSpaces': []}
+            result.append(row)
             try:
                 self.controller.authority.validate_scope(scope, self.controller.machine_id)
-                row.update(observe_epics(Project(self.controller.authority, scope)))
             except (Refusal, OSError, ValueError) as error:
-                row['errors'] = [{'error': str(error)}]
-            result.append(row)
+                row['errors'].append({'error': str(error)})
+                continue
+            observer = Project(self.controller.authority, scope)
+            try:
+                row.update(observe_epics(observer))
+            except (Refusal, OSError, ValueError, RuntimeError) as error:
+                row['errors'].append({'error': str(error)})
+            try:
+                names = reconcile_project_spaces(observer, self.hosting, self.controller.machine_id)
+                row['renamedSpaces'].extend(names['renamed'])
+                row['errors'].extend(names['errors'])
+            except (Refusal, OSError, ValueError, RuntimeError) as error:
+                row['errors'].append({'error': str(error)})
+            # Retained controller workspaces are authoritative even before an
+            # omp_session mirror exists, and after release or a newer attempt.
+            # Presentation never writes the lifecycle document or its fences.
+            for saved_scope in scopes:
+                if (saved_scope['machineId'] != self.controller.machine_id
+                        or any(saved_scope[key] != project[key] for key in ('repository', 'beadsDir'))):
+                    continue
+                try:
+                    doc = self.controller.store.read(saved_scope)
+                    paths = dict.fromkeys(run['workspace']['path'] for run in doc['runs'].values()
+                                          if run.get('workspace'))
+                    if not paths:
+                        continue
+                    issue = self.controller.authority.issue(saved_scope)
+                    spaces = self.hosting.spaces()
+                    for path in paths:
+                        renamed = reconcile_space_names(issue, path, spaces, self.hosting.app)
+                        row['renamedSpaces'].extend(space for space in renamed if space not in row['renamedSpaces'])
+                except (Refusal, OSError, ValueError, RuntimeError) as error:
+                    row['errors'].append({'issue': saved_scope['issueId'], 'error': str(error)})
         return result
 
     def reconcile_once(self):

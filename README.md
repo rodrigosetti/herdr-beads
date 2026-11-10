@@ -111,7 +111,9 @@ go-bd <issue-id>               # Start/resume in the current terminal
 
 Start resolves the full issue ID, checks readiness/inherited blockers, claims atomically, and creates or reuses its issue-named omp worktree. A self-owned, unblocked `in_progress` issue can resume after its previous agent ends. Other owners' claims are not overwritten.
 
-Worktree directories, agent tabs, and worktree space names use the full bead ID, such as `myproject-123`, without an additional repository-name prefix.
+Worktree directories, Git branches, and agent tabs use the full bead ID, such as `myproject-123`, without an additional repository-name prefix. The user-visible Herdr worktree **space name is exactly the current Beads title**, with no ID prefix. Creation, reuse, and focus apply that display label; service polling and the local dashboard's 10-second refresh reconcile title edits automatically. `go-bd --reconcile-spaces --json` also refreshes existing local session-associated spaces without launching or resuming anything. Naming failures appear in service project health or the dashboard.
+
+Display labels are never workspace or session identity. Duplicate titles are allowed: matching uses the recorded workspace path and canonical issue/session association, not the title. A title edit does not rename a Git branch, move a directory, create another worktree, replace a space/tab/terminal, or change the saved conversation.
 
 The installed legacy launcher focuses a live associated omp session or resumes its exact saved conversation in the original worktree. The controller dashboard source instead uses controller actions, durable run/session identity and capability refusals; it never reads `metadata.omp_session` or checks process/transcript names to choose an action. Each launch pins `BEADS_DIR` to the canonical shared database. The concrete workspace adapter respects omp configuration and refuses foreign-repository/wrong-branch resources.
 

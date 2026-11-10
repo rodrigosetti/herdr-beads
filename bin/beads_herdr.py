@@ -4,6 +4,7 @@ from pathlib import Path
 
 from beads_contract import Refusal
 from beads_identity import command
+from beads_presentation import issue_space_name, reconcile_space_names
 
 
 class HerdrHosting:
@@ -100,22 +101,25 @@ class HerdrHosting:
         return {'machineId': run['scope']['machineId'], 'address': address,
                 'spaceId': space_id, 'tabId': tab_id}
 
-    def start(self, run, argv):
+    def start(self, run, argv, *, issue):
         destination = run['workspace']['path']
-        matching = next((space for space in self.spaces() if space.get('folder')
+        spaces = self.spaces()
+        reconcile_space_names(issue, destination, spaces, self.app)
+        matching = next((space for space in spaces if space.get('folder')
                          and str(Path(space['folder']).resolve()) == destination), None)
         if matching:
             result = self.app('tab.new', space=matching['id'], name=run['scope']['issueId'],
                               folder=destination, argv=argv)
             result.setdefault('space', matching['id'])
         else:
-            result = self.app('space.new', name=run['scope']['issueId'], folder=destination,
+            result = self.app('space.new', name=issue_space_name(issue), folder=destination,
                               tab=run['scope']['issueId'], machine='', argv=argv)
         if not all(result.get(key) for key in ('terminal', 'space', 'tab')):
             raise Refusal('evidence_unavailable', 'Herdr creation outcome uncertain; reconnect to the operation, never relaunch.', True)
         self.associate(run, result['terminal'])
         return result
 
-    def focus(self, run, info):
+    def focus(self, run, info, *, issue):
         self.validate(run, info)
+        reconcile_space_names(issue, run['workspace']['path'], self.spaces(), self.app)
         self.app('agent.focus', terminal=info['address'])
