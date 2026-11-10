@@ -10,7 +10,7 @@ const sameFence = (a, b) => a?.runId === b?.runId && a?.attempt === b?.attempt &
 // Explicitly loaded by the concrete omp adapter, never ambient discovery.
 export default function (pi) {
   let config;
-  const configPath = process.env.GO_BD_SESSION_CONFIG;
+  const configPath = process.env.BEADS_OMP_SESSION_CONFIG;
   try {
     config = JSON.parse(readFileSync(configPath, 'utf8'));
     if (!config.terminal && process.env.HC_TERMINAL_ID) config.terminal = {
@@ -28,7 +28,7 @@ export default function (pi) {
     }
     if (realpathSync(config.worktree) !== config.worktree) throw new Error('workspace path must be canonical');
   } catch (error) {
-    console.error(`go-bd: refusing untracked session: ${error.message}`);
+    console.error(`herdr-beads: refusing untracked session: ${error.message}`);
     process.exit(1);
   }
 
@@ -128,7 +128,7 @@ export default function (pi) {
 
   function fatal(error, ctx) {
     frozen = true;
-    const message = `go-bd: refusing untracked work: ${error.message || error}`;
+    const message = `herdr-beads: refusing untracked work: ${error.message || error}`;
     try { if (binding) save(); atomic(config.ack, { error: message }); } catch { /* stderr remains authoritative */ }
     ctx.ui.notify(message, 'error');
     console.error(message);
@@ -397,7 +397,7 @@ export default function (pi) {
     pi.registerCommand(name, { description, handler: (args, ctx) => serial(async () => {
       if (ctx.agent.kind !== 'main') return ctx.ui.notify('Only the primary Bead session may perform owner commands', 'error');
       try { await action(args, ctx); }
-      catch (error) { ctx.ui.notify(`go-bd: ${error.message}; inspect controller state before retrying`, 'error'); }
+      catch (error) { ctx.ui.notify(`herdr-beads: ${error.message}; inspect controller state before retrying`, 'error'); }
     }) });
   }
 
@@ -410,7 +410,7 @@ export default function (pi) {
     try {
       if (binding) save();
       if (initialized && !released && pending === 0) await observe({ kind: 'exited', exitCode: null, activity: 'unknown' }, 500);
-    } catch (error) { console.error(`go-bd: shutdown notification unacknowledged; reconciliation required: ${error.message}`); }
+    } catch (error) { console.error(`herdr-beads: shutdown notification unacknowledged; reconciliation required: ${error.message}`); }
     finally { ownedRelease?.(); }
   });
 }

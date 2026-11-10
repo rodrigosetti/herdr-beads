@@ -114,11 +114,14 @@ class Controller:
         support = self.support()
         supported = support['execution']['supported']
         actions = []
-        methods = ('start_or_focus', 'resume', 'handoff', 'release', 'reconcile') if run else ('start_or_focus',)
+        methods = ('start_or_focus', 'resume', 'handoff', 'release', 'reconcile') if run else ('start_or_focus', 'adopt_legacy')
+        if run and not run['execution']['session'] and operation and operation['method'] == 'adopt_legacy':
+            methods = (*methods, 'adopt_legacy')
         for method in methods:
             refusal = None
             capabilities = {
                 'start_or_focus': START_CAPABILITIES,
+                'adopt_legacy': START_CAPABILITIES,
                 'resume': ('exact_resume', 'durable_identity', 'owner_activity'),
                 'handoff': ('structured_handoff',),
                 'release': ('explicit_release', 'durable_identity', 'owner_activity'),
@@ -132,7 +135,9 @@ class Controller:
                 refusal = 'run_released'
             elif any(capability not in supported for capability in capabilities):
                 refusal = 'unsupported_capability'
-            elif method == 'start_or_focus' and not self.workspace:
+            elif method in ('start_or_focus', 'adopt_legacy') and not self.workspace:
+                refusal = 'unsupported_capability'
+            elif method == 'adopt_legacy' and (not hasattr(self.execution, 'adopt') or not hasattr(self.workspace, 'adopt')):
                 refusal = 'unsupported_capability'
             elif run:
                 if method in ('start_or_focus', 'resume', 'handoff') and not run['workspace']:

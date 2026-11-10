@@ -36,7 +36,7 @@ class Hosting:
         if self.uncertain:
             raise Refusal('evidence_unavailable', 'reply lost', True)
 
-    def find_operation(self, run, path, *, address=None):
+    def find_operation(self, run, path, *, address=None, config_env='BEADS_OMP_SESSION_CONFIG'):
         return self.current
 
     def associate(self, run, address):
@@ -206,14 +206,128 @@ class OmpTests(unittest.TestCase):
         self.assertEqual(len(self.hosting.starts), 1)
         self.assertEqual(self.authority.row['metadata']['other'], {'keep': True})
 
+
+    def test_pre_cutover_journal_recovers_immutable_terminal_without_relaunch(self):
+        config = self.adapter.config(self.run, self.intent, self.private)
+        del config['sessionConfigEnv']
+        durable_json(self.adapter.path(self.run), config)
+        self.ack(config)
+        info = copy.deepcopy(self.hosting.current)
+        info['labels'] = HerdrHosting.labels(self.run)
+        info['argv'] = ['env', f'BEADS_DIR={self.run["scope"]["beadsDir"]}',
+                        f'GO_BD_SESSION_CONFIG={self.adapter.path(self.run)}',
+                        'omp', '--extension', '/retired/go-bd-session.mjs']
+        self.hosting = MemoryHerdr(terminals={'t1': info})
+        self.adapter.hosting = self.hosting
+        before = self.adapter.path(self.run).read_bytes()
+        result = self.adapter.recover('launch', self.run, self.intent, self.private)
+        self.adapter.validate_observation(self.run, result['observation'], self.private)
+        self.assertEqual(result['observation']['event']['session']['sessionId'], 'exact-session')
+        self.assertEqual(self.adapter.path(self.run).read_bytes(), before)
+        self.assertEqual(self.hosting.terminals['t1']['argv'], info['argv'])
+        self.assertEqual(self.hosting.events, [])
+
+    def test_new_journal_cannot_recover_a_legacy_environment_marker(self):
+        config = self.adapter.config(self.run, self.intent, self.private)
+        self.ack(config)
+        info = copy.deepcopy(self.hosting.current)
+        info['argv'] = ['env', f'GO_BD_SESSION_CONFIG={self.adapter.path(self.run)}', 'omp']
+        self.adapter.hosting = MemoryHerdr(terminals={'t1': info})
+        self.assertIsNone(self.adapter.recover('launch', self.run, self.intent, self.private))
+
+    def test_unknown_journal_environment_identity_refuses(self):
+        config = self.adapter.config(self.run, self.intent, self.private)
+        config['sessionConfigEnv'] = 'UNRECOGNIZED_SESSION_CONFIG'
+        durable_json(self.adapter.path(self.run), config)
+        with self.assertRaises(Refusal) as error:
+            self.adapter.recover('launch', self.run, self.intent, self.private)
+        self.assertEqual(error.exception.code, 'session_mismatch')
+
     def test_resume_uses_exact_transcript_without_new_prompt_or_restore(self):
         self.previous()
         self.assertIsNone(self.adapter.perform('resume', self.run, self.intent, self.private))
         argv = self.hosting.starts[0]
         self.assertEqual(argv[-2:], ['--resume', str(self.transcript)])
+        self.assertIn(f'BEADS_OMP_SESSION_CONFIG={self.adapter.path(self.run)}', argv)
+        self.assertEqual(argv[argv.index('--extension') + 1], str(self.adapter.extension))
         config = json.loads(self.adapter.path(self.run).read_text())
         self.assertNotIn('prompt_file', config)
         self.assertNotIn('--restore', argv)
+
+    def test_absent_metadata_is_fresh_only_without_a_retained_session(self):
+        del self.authority.row['metadata']
+        self.assertIsNone(self.adapter.preflight(self.run))
+        self.run['execution']['session'] = {'harness': 'omp', 'sessionId': 'exact-session', 'bindingId': 'old-binding'}
+        self.intent['steps'] = ['resume']
+        with self.assertRaises(Refusal) as error:
+            self.adapter.perform('resume', self.run, self.intent, self.private)
+        self.assertEqual(error.exception.code, 'session_missing')
+        self.assertEqual(self.hosting.starts, [])
+
+    def test_present_malformed_metadata_never_enters_fresh_launch(self):
+        for value in ([], '', False):
+            with self.subTest(metadata=value):
+                self.authority.row['metadata'] = value
+                with self.assertRaises(Refusal) as error:
+                    self.adapter.perform('launch', self.run, self.intent, self.private)
+                self.assertEqual(error.exception.code, 'invalid_record')
+        for value in (None, {}, [], '', {'session_id': 'partial'}):
+            with self.subTest(session=value):
+                self.authority.row['metadata'] = {'omp_session': value}
+                with self.assertRaises(Refusal):
+                    self.adapter.perform('launch', self.run, self.intent, self.private)
+        self.assertEqual(self.hosting.starts, [])
+        self.assertFalse(self.adapter.path(self.run).exists())
+
+    def test_resume_accepts_exact_session_header_preceded_by_title(self):
+        self.previous()
+        history = (json.dumps({'type': 'session_title', 'title': 'Not identity'}) + '\n'
+                   + self.transcript.read_text())
+        self.transcript.write_text(history)
+        self.assertIsNone(self.adapter.perform('resume', self.run, self.intent, self.private))
+        self.assertEqual(self.hosting.starts[0][-2:], ['--resume', str(self.transcript)])
+        self.assertEqual(self.transcript.read_text(), history)
+
+    def test_wrong_transcript_directory_refuses_without_new_terminal(self):
+        self.previous()
+        self.transcript.write_text(json.dumps({'type': 'session', 'id': 'exact-session',
+                                             'cwd': str(self.root)}) + '\n')
+        with self.assertRaises(Refusal) as error:
+            self.adapter.perform('resume', self.run, self.intent, self.private)
+        self.assertEqual(error.exception.code, 'session_mismatch')
+        self.assertEqual(self.hosting.starts, [])
+
+    def test_relative_record_paths_refuse_without_new_terminal(self):
+        self.previous()
+        for field, value in (('session_file', 'exact.jsonl'), ('worktree', 'workspace')):
+            with self.subTest(field=field):
+                original = self.record[field]
+                self.record[field] = value
+                with self.assertRaises(Refusal):
+                    self.adapter.perform('resume', self.run, self.intent, self.private)
+                self.record[field] = original
+        self.assertEqual(self.hosting.starts, [])
+
+    def test_missing_original_workspace_refuses_without_recreation(self):
+        self.previous()
+        self.worktree.rmdir()
+        with self.assertRaises(Refusal) as error:
+            self.adapter.perform('resume', self.run, self.intent, self.private)
+        self.assertEqual(error.exception.code, 'workspace_missing')
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(self.hosting.starts, [])
+
+    def test_invalid_startup_journal_is_retained_and_refused(self):
+        self.adapter.config(self.run, self.intent, self.private)
+        path = self.adapter.path(self.run)
+        for value in ('not JSON', 'null', '[]', '"not a configuration"'):
+            with self.subTest(journal=value):
+                path.write_text(value)
+                with self.assertRaises(Refusal) as error:
+                    self.adapter.recover('launch', self.run, self.intent, self.private)
+                self.assertEqual(error.exception.code, 'invalid_record')
+                self.assertEqual(path.read_text(), value)
+        self.assertEqual(self.hosting.starts, [])
 
     def test_foreign_missing_mismatched_and_leased_history_refuse_before_terminal(self):
         self.previous()

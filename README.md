@@ -1,20 +1,21 @@
 # Beads in Herdr
 
-User-level native Herdr mods for browsing any project's Beads issues and opening issue-specific omp worktree sessions. This standalone source checkout lives at `~/.local/share/herdr-beads`, outside project repositories. Shipped Herdr layouts and mods are not modified.
+User-level native Herdr mods for browsing Beads issues and managing issue-specific omp sessions through one local lifecycle controller. This source checkout lives at `~/.local/share/herdr-beads`, outside project repositories. Shipped Herdr layouts and mods are not modified.
 
 ## Install and open
 
-The dashboard/legacy launcher requires Herdr running locally, `hc`, `bd`, `git`, `omp`, and Python 3 on PATH. The independent background service has narrower requirements, documented below. Node is only needed for the model regression tests.
+Controller installation requires macOS launchd, `git`, `bd`, and Python 3 with `venv`/`pip`. Herdr execution additionally requires local Herdr, `hc`, `herdr-app`, and omp 18.17's worktree registry and extension APIs. GitHub PR verification requires `gh` and provider access; offline LOCAL work does not. Node is needed only for JavaScript regression tests.
 
 ```sh
-bash ~/.local/share/herdr-beads/install.sh
-cd /path/to/project
-go-bd --dashboard
+bash ~/.local/share/herdr-beads/install.sh install --project /absolute/main-checkout
+herdr-app do layout.switch --name beads-workspace
 ```
 
-The installer retains the existing mods, personal layout, and legacy launcher setup, and also provisions the per-user launchd service described below. It copies `beads-dashboard`, `bead-detail`, and `beads-sidebar` into `${HERDR_APP_HOME:-~/.config/herdr-app}/mods`, installs the personal `beads-workspace` layout, and updates `~/.local/bin/go-bd` together with its `go-bd-session.mjs` startup extension and `beads_epics.py` policy module. Keep these three files together. An existing personal layout file is preserved on reinstall. Keep `~/.local/bin` on PATH. `HERDR_APP_HOME` selects a different Herdr window/configuration.
+`install.sh` provisions the controller service and installs `beads-dashboard`, `bead-detail`, and `beads-sidebar` into `${HERDR_APP_HOME:-~/.config/herdr-app}/mods`. It installs the personal `beads-workspace` layout only when absent: an existing personal layout is preserved, so merge the sidebar integration deliberately if your custom layout does not already include it. `HERDR_APP_HOME` selects the Herdr configuration. New launches use the service-adjacent `bin/beads_omp_session.mjs`, never a standalone launcher or user-bin extension.
 
-`go-bd --dashboard` opens or focuses the project's Beads tab in its main-checkout space. The dashboard stays pinned to that project when another pane changes directory. Invoking the command from a linked worktree or nested folder resolves the same main checkout and database.
+The installer writes absolute bridge/interpreter/config paths into the installed dashboard's `installation.js`; explicit pane props can override them for inspection. Source and generated extension/adapter/UI packaging remain owned here, not by Herdr or omp-core.
+
+Open the project in a Herdr space and use its **Beads** sidebar button. All lifecycle actions go through the installed controller; service loss is an explicit refusal, not a local-launch fallback.
 
 ### Sidebar button
 
@@ -26,7 +27,7 @@ herdr-app do layout.switch --name beads-workspace
 
 Click **Beads** above Settings in the sidebar. It opens a dashboard tab inside the currently selected space, using that space's first terminal's live folder. If the space already has a Beads dashboard, the button selects its existing tab and focuses the dashboard pane instead of creating a duplicate. The button remains available as an icon when the sidebar is collapsed and highlights while its dashboard tab is selected.
 
-Unlike the sidebar button, `go-bd --dashboard` opens the dashboard in the project's main-checkout space. Both views use the same shared project database. Herdr remembers the selected layout across restarts; switching back to `main` restores the shipped interface without removing any tabs or sessions.
+All dashboards for the same project use its canonical shared Beads database. Herdr remembers the selected layout across restarts; switching back to `main` restores the shipped interface without removing any tabs or sessions.
 
 
 ## Background lifecycle service (macOS)
@@ -48,7 +49,7 @@ bash ~/.local/share/herdr-beads/install.sh stop
 bash ~/.local/share/herdr-beads/install.sh install --no-start --project /absolute/main-checkout
 ```
 
-`stop` unloads only this user's service and retains its configuration/state; `restart` loads it again. Normal install and restart use scoped `launchctl bootout`, `bootstrap`, `kickstart`, and `print` in `gui/$(id -u)`. Failures are nonzero with diagnostics; only bootout's explicit “No such process”/missing-service result is accepted as already stopped. Startup must report service health within ten seconds. `--no-start` makes **no launchctl calls**, even when reinstalling over a currently loaded job.
+`stop` unloads only this user's service and retains its configuration/state; `restart` loads it again. Normal install and restart use scoped `launchctl bootout`, `bootstrap`, `kickstart`, and `print` in `gui/$(id -u)`. Failures are nonzero with diagnostics; only bootout's explicit “No such process”/missing-service result is accepted as already stopped. Startup must report service health within ten seconds. `--no-start` makes **no launchctl calls** and refuses a live singleton rather than mutating its installed package.
 
 Defaults:
 
@@ -58,6 +59,7 @@ Defaults:
 - Logs: the same directory's `logs/stdout.log` and `logs/stderr.log`.
 - LaunchAgent: `~/Library/LaunchAgents/com.herdr.beads.plist`.
 - Stable machine identity: `${XDG_STATE_HOME:-~/.local/state}/herdr-beads/machine-id`, imported unchanged from `go-bd/machine-id` when present. Both files are retained; conflicting/invalid identities refuse startup.
+- Cutover journal: the same state directory's `install-cutover.json`; retained per-install receipts and original retired executable bytes: `installations/<id>/`.
 
 Service/config/store/log directories are owner-only; config, plist, and logs are 0600. The plist contains only explicit `HOME`, `USER`, `LOGNAME`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `HERDR_APP_HOME`, and a bounded executable-directory/system PATH; inherited `BEADS_DIR` and secrets are excluded. `status` prints config, health, log, socket, and store paths, optional capability gaps, launchctl state, and runtime health; launchctl or health errors remain visible and return nonzero. For direct launchd diagnostics:
 
@@ -65,11 +67,17 @@ Service/config/store/log directories are owner-only; config, plist, and logs are
 /bin/launchctl print "gui/$(id -u)/com.herdr.beads"
 ```
 
-For isolated provisioning, set absolute `HERDR_BEADS_INSTALL_ROOT`, `HERDR_BEADS_STATE_HOME` (the state-home base), and `HERDR_BEADS_LAUNCH_AGENTS`; use the same overrides for subsequent management. These do not create a second label. **Use `--no-start` for isolation:** without it, management still targets the one normal per-user label. `HERDR_BEADS_PYTHON=/absolute/python3` selects the bootstrap interpreter; the venv uses its resolved real interpreter, not a pyenv shim.
+For isolated provisioning, set absolute `HERDR_BEADS_INSTALL_ROOT`, `HERDR_BEADS_STATE_HOME` (the state-home base), `HERDR_BEADS_LAUNCH_AGENTS`, and `HERDR_BEADS_BIN_HOME` (normally `~/.local/bin`, used for owned legacy executable retirement); use the same overrides for subsequent management. These do not create a second label. **Use `--no-start` for isolation:** without it, management still targets the one normal per-user label. `HERDR_BEADS_PYTHON=/absolute/python3` selects the bootstrap interpreter; the venv uses its resolved real interpreter, not a pyenv shim.
 
-The installed package includes the repository's Python adapters and `.mjs` extension files together. Composition is static: only `beads_omp.create_adapters(executables)` may supply execution/workspace adapters, with the service's exact socket bound to the concrete execution adapter. Missing module/factory means unsupported execution capabilities, not a legacy fallback; concrete adapter delivery is `herdr-beads-2hv.3`.
+The installed package includes the Python controller/adapters, schemas, UI bridge and `bin/beads_omp_session.mjs` together. Composition is static: `beads_omp.create_adapters(executables)` supplies the concrete execution/workspace adapters with the exact service socket. Controller policy is harness-neutral, but shipped execution is **omp-only** and depends separately on omp's worktree registry. Missing modules, registry bindings or tools refuse execution; they never select another harness.
 
-Installed smoke evidence: a disposable real Beads/Git project with no remotes reached the persisted manual handoff with all four optional tools disabled; singleton refusal, canonical-target invalidation, periodic rediscovery, process suspend/resume, SIGKILL/launchd recovery, idempotent reinstall/stop, externally closed/released workspace retention, and read-only sessionless epic progress were exercised. A second installed PR run remained visibly held for missing `gh` while local work progressed. Execution receipts were seeded through the deterministic test adapter; real omp launch and managed-project PR/UI cutover are not inferred. The active user Herdr app was not quit, and machine-wide sleep was not exercised.
+On upgrade, rerun `install.sh install` with the same overrides and registrations, then reload existing dashboard tabs to load the installed mods. Do not run another controller against the same socket/store. Existing runs, transcripts, machine identity, immutable creation records and receipts remain retained. For existing history, use **Adopt existing session — preserve history** when the controller advertises it; Start never silently adopts. A live session's already-loaded extension is left untouched. Restarting an old terminal's immutable creation argv after extension retirement is unsupported: use controller/dashboard exact **Resume** to open the retained transcript in a new terminal with the renamed service-adjacent extension.
+
+Installation preflights executable ownership, startup acknowledgements and locks before switching workflows. Unknown, symlinked or foreign legacy copies refuse visibly. A live legacy startup without its exact acknowledgement blocks retirement; an inactive failed startup may remain as historical evidence only after independent terminal inspection under the launch/controller locks. Nothing rewrites or deletes its failed receipt. Close only terminal-free legacy dashboard tabs before upgrading if their refresh owns `epics.lock`; keep all session tabs and workspaces. Normal install stops the old service before package changes, then health-checks the controller before activating mods. Original retired executable bytes and receipts remain archived. If cutover is incomplete, restart refuses: rerun install with the same settings to recover forward from its journal.
+
+For troubleshooting, start with `install.sh status` and the printed service health/log paths. Check that Herdr/core, dashboard and service use the same `XDG_STATE_HOME` and `HERDR_APP_HOME`, that executable paths still exist after tool upgrades, and that omp recognizes the exact linked workspace in its own registry. Do not fabricate registry entries, reset the store/machine identity or delete receipts to clear a refusal. Provider outages hold PR proof without blocking offline LOCAL observation. A timeout leaves an inspectable operation, not permission to repeat terminal creation.
+
+For isolated native smoke runs with long state-home paths, set a short `HC_SESSION` consistently for the manually started fixture app/core/service and CLI clients; macOS Unix sockets are path-length limited. The installed production LaunchAgent uses the normal per-user core session.
 
 ## Dashboard
 
@@ -86,9 +94,9 @@ Installed smoke evidence: a disposable real Beads/Git project with no remotes re
 
 The mod uses Herdr's `exec` API for Beads reads; it does not read exports or query Dolt directly. Attention comes from Herdr reactively and does not grant lifecycle authority. Browsing remains machine-scoped; controller execution is local-machine only, with an explicit remote-machine refusal and no local-launch fallback.
 
-### Controller dashboard source — installation held for cutover
+### Controller actions and lifecycle
 
-`mods/beads-dashboard` now uses `bin/beads_ui.py` and controller-v1 for actions and lifecycle state. This change does **not** replace installed mods, the launcher, or the running production service; coordinated installation remains `herdr-beads-rlm.4`. The default bridge/interpreter paths are `~/.local/share/herdr-beads-service/bin/beads_ui.py` and its `venv/bin/python`. Development tabs can explicitly pass `lifecycleBridge`, `lifecyclePython`, and `lifecycleConfig` props; `dashboardMod` identifies a separately named development copy.
+The installed dashboard uses service-adjacent `bin/beads_ui.py` and controller-v1 for actions and lifecycle state. Default bridge/interpreter paths are `~/.local/share/herdr-beads-service/bin/beads_ui.py` and its `venv/bin/python`. Explicit `lifecycleBridge`, `lifecyclePython`, and `lifecycleConfig` props support isolated installations; `dashboardMod` identifies a separately named mod copy.
 
 - **Actions** inspects an issue through controller status. Start, focus, exact resume, structured submission, integration verification, and explicit owner release follow controller-advertised availability/refusals. Only **omp** is supported; another agent appearing in Herdr is not a supported execution harness. Missing adapter capabilities remain unavailable, not a harness picker or launcher fallback.
 - The destination is shown before starting. The default is explicit `local-target` on the canonical repository's `refs/heads/master`; **Configure explicit destination** edits a Target JSON object for new runs. `git config herdr.beads.target '<Target JSON>'` supplies a project default. A remote never selects PR mode. Local mode requires no PR, `gh`, authentication, or network; PR mode records provider host/stable repository ID/owner/name and full expected base ref.
@@ -98,53 +106,34 @@ The mod uses Herdr's `exec` API for Beads reads; it does not read exports or que
 - Complete verified coverage shows **Merged — awaiting manual closure**. The closure button **copies only** the controller's safely quoted normal `bd close --reason` command. Its limitation is explicit: normal manual Beads closure is not revision/run guarded. Herdr never executes/retries closure or workspace/registry/terminal deletion. External closure is an observation, not ownership proof; retained resources still require separate operator-reviewed manual cleanup. Reopen, reassignment or invalidated evidence suppress stale closure handoffs.
 - Rewritten local history remains **Integration needs confirmation**, distinct from **Awaiting PR merge** and provider errors. The details explain the trusted local owner-receipt path; the socket/UI cannot attest it. See the controller receipt contract below.
 
-Observed source-dashboard smoke (2026-11-09): a separately named native development mod and isolated real controller exercised start, focus without duplication, exact-session resume, structured local and PR submissions, copy-only closure, tab recreation, filter counts and detail-pane reuse. Offline local proof used a no-remote fixture target at `61e687ee8e6f64eaba3ed2072e772d87d97386eb`, first visibly held for confirmation and then advanced by the fixture driver; genuine read-only PR proof used existing [NVIDIA/OpenShell#5077](https://github.com/NVIDIA/OpenShell/pull/5077), exact head `958efaa3d826cdc067fe9f357e5db41ce23141ee`, repository ID `1166129534`, and `refs/heads/windows`. External fixture-only normal Beads closure reduced All open/Ready counts without hiding its retained run; reopening invalidated the handoff without reclosure or deletion. Real startup exposed a recovery race that rewound an accepted binding to `starting`; the controller now preserves that binding/turn state, with a failing-before/passing-after regression. Native commands and screenshots exercised the running surface; pointer dispatch and production/managed-project cutover acceptance are not inferred from this isolated smoke.
-
-Stopping the isolated service retained inspectable last-good runs and disabled lifecycle actions/manual-command copying. A remote-machine tab visibly refused without a local run. Removing only the fixture's configured `gh` capability held the PR run with its exact provider error while the local run remained independently retained; restoring it reverified the genuine PR evidence. Operation errors survived ordinary Beads refreshes. Final checks: 175 Python tests, 57 JavaScript tests, and all three native mod checks passed. Explicit release/read-only enforcement remain unavailable where the concrete adapter reports those capability gaps; no fallback or destructive cleanup was attempted.
 
 ## Start and return to work
 
-```sh
-go-bd --herdr <issue-id>       # Start, resume saved conversation, or focus live session
-go-bd <issue-id>               # Start/resume in the current terminal
-```
+Select an issue, open **Actions**, review the explicit destination, then use the controller-advertised Start, Focus or exact Resume action. Start checks readiness/inherited blockers and current ownership before claiming and preparing an omp workspace. Other owners' claims are not overwritten. An uncertain operation must be inspected or recovered with the same request, not replaced by another launch.
 
-Start resolves the full issue ID, checks readiness/inherited blockers, claims atomically, and creates or reuses its issue-named omp worktree. A self-owned, unblocked `in_progress` issue can resume after its previous agent ends. Other owners' claims are not overwritten.
+Workspaces use full issue identity; their Herdr space display name is the current Beads title. Duplicate titles are allowed: identity comes from canonical repository/database, run, workspace and session bindings, never the display label. Title changes do not move workspaces, rename branches or replace saved conversations.
 
-Worktree directories, Git branches, and agent tabs use the full bead ID, such as `myproject-123`, without an additional repository-name prefix. The user-visible Herdr worktree **space name is exactly the current Beads title**, with no ID prefix. Creation, reuse, and focus apply that display label; service polling and the local dashboard's 10-second refresh reconcile title edits automatically. `go-bd --reconcile-spaces --json` also refreshes existing local session-associated spaces without launching or resuming anything. Naming failures appear in service project health or the dashboard.
-
-Display labels are never workspace or session identity. Duplicate titles are allowed: matching uses the recorded workspace path and canonical issue/session association, not the title. A title edit does not rename a Git branch, move a directory, create another worktree, replace a space/tab/terminal, or change the saved conversation.
-
-The installed legacy launcher focuses a live associated omp session or resumes its exact saved conversation in the original worktree. The controller dashboard source instead uses controller actions, durable run/session identity and capability refusals; it never reads `metadata.omp_session` or checks process/transcript names to choose an action. Each launch pins `BEADS_DIR` to the canonical shared database. The concrete workspace adapter respects omp configuration and refuses foreign-repository/wrong-branch resources.
+Each launch pins `BEADS_DIR` to the canonical shared database. The execution adapter validates exact durable session identity; the workspace adapter independently validates omp registry/source, Git common directory and branch. Supported workspaces are **linked Git worktrees only**. On omp 18.17 independent clones lack a supported registry binding and are retained/refused, not accepted via clone-origin inference or relaxed validation.
 
 ### Epics are containers
 
-Epics offer no Start or Resume action. Both direct and Herdr launch entrypoints reject epics before claiming or preparing a session/worktree. Start a concrete child task instead, including planning and investigation work. Existing legacy epic terminals remain focusable in the dashboard; their saved associations are preserved, not resumed or replaced.
+Epics offer no Start or Resume action and cannot be claimed as executable sessions. Start a concrete child task instead, including planning and investigation work. Existing historical epic associations remain retained for inspection.
 
-`go-bd --reconcile-epics --json` returns read-only direct-child progress and per-epic errors from the canonical project database. Only `closed` children count as complete; actual parent edges determine membership, not dotted IDs. Nonempty all-closed epics report eligibility for **owner review**, but no refresh/service command closes, reopens, retries closure, or changes issue status. Empty epics are not eligible. Nested epic progress uses direct observed child states without inventing transitive closure.
+The service's `bin/beads_epics.py` observer supplies read-only direct-child progress. Only `closed` children count; actual parent edges determine membership, not dotted IDs. Nonempty all-closed epics report eligibility for **owner review**, never automatic closure. Empty epics are not eligible; nested progress does not invent transitive closure.
 
-The installed legacy dashboard's progress command and the independent service use `bin/beads_epics.py`'s `observe_epics(project)`; the controller dashboard consumes the service's scoped progress snapshot. Explicitly registered sessionless projects and projects discovered from durable local runs are observed at startup, periodic passes, and validated-request wakeups. Per-project/per-epic errors remain visible without blocking issue browsing. This read-only policy supersedes earlier automatic epic-close/reopen behavior under the approved manual-completion scope.
+Registered sessionless projects and projects discovered from durable local runs are observed at startup, periodic passes and validated-request wakeups. Per-project/per-epic errors remain visible without blocking browsing. No refresh/service operation closes, reopens or repairs an epic.
 
 Child counts and manual Beads closure are not one atomic transaction. Owners review current child state and normal Beads close gates separately; no force, raw SQL, or background repair bypass is used.
 
 ### Session association
 
-The launcher labels the core terminal with `beads.project=<canonical .beads path>` and `beads.issue=<full issue ID>`. This explicit association survives app restarts. Sessions started before installation are not guessed from titles. To associate a known existing session manually:
-
-```sh
-hc label <terminal-address> beads.project=/absolute/project/.beads beads.issue=<full-issue-id>
-```
+Controller-created terminals carry canonical `beads.project` and `beads.issue` labels, but labels alone do not authorize adoption or execution. Existing sessions require the explicit validated legacy-adoption boundary described below; neither titles nor a manually applied label establish ownership.
 
 ### Persistent conversations
 
-Both direct and Herdr launches load the explicit startup extension. It obtains the actual persistent session ID and transcript path from omp's lifecycle API, makes the transcript durable, and saves an object in the bead's `metadata.omp_session` with:
+The controller loads the service-adjacent startup extension with `BEADS_OMP_SESSION_CONFIG`. It obtains the actual persistent session ID and transcript path from omp's lifecycle API and publishes a durable fenced binding to the controller. The execution adapter alone owns the field-preserving `metadata.omp_session` mirror: exact `session_id`, absolute `session_file`, stable local `machine` and original `worktree`.
 
-- `session_id`: the exact omp session ID, not a guessed newest session or ID prefix.
-- `session_file`: the absolute saved transcript path.
-- `machine`: a local identity stored in `${XDG_STATE_HOME:-~/.local/state}/go-bd/machine-id`.
-- `worktree`: the original absolute worktree directory.
-
-The extension publishes the durable transcript binding to the controller; its execution adapter owns the field-preserving `metadata.omp_session` mirror. A fresh task and launcher acknowledgement require the controller's exact-session acknowledgement after validation and metadata publication. The extension makes no Beads mutations. Subagents cannot replace the primary association. Switch, fork/branch, and tree navigation are explicitly refused while mapped: they require a new controller binding, not an implicit conversation replacement.
+A fresh task requires exact-session acknowledgement after validation and metadata publication. The extension makes no Beads mutations. Subagents cannot replace the primary association. Switch, fork/branch and tree navigation are refused while mapped: they require a new controller binding, not an implicit conversation replacement.
 
 Resume uses `omp --resume <session_file>` with no new startup task and no `--restore`: it reopens the conversation and waits for input rather than automatically restarting interrupted work. The original transcript ID, machine, directory, repository, and worktree branch are checked. Missing transcripts/worktrees, malformed records, foreign-machine records, or conflicting session ownership fail explicitly rather than starting fresh. Recorded history on a non-`in_progress` issue is not automatically replaced or resumed.
 
@@ -165,11 +154,11 @@ Session states are independent of issue status:
 
 `Done · unseen` becomes `Idle` when acknowledged through Herdr. It never means the bead was closed. Session launching does not close tasks, merge code, remove worktrees, or push. Epic child-driven reconciliation is separate from session launching. Follow the repository's merge/close policy for executable work.
 
-Per-project launch locks and terminal/dashboard receipts live under `${XDG_STATE_HOME:-~/.local/state}/go-bd`. Concurrent launches are refused rather than duplicated. A failed or unconfirmed launch reports an error and preserves any claimed issue, worktree, and terminal for inspection; retry focuses a live omp session if one exists. Slow launches can exceed Herdr exec's 30-second limit: inspect the associated terminal before retrying.
+Journaled operations and owner-only session configurations live under `${XDG_STATE_HOME:-~/.local/state}/herdr-beads`. Scope and worker locks serialize effects; concurrent or uncertain launches are refused/held rather than duplicated. A failed launch preserves its claim, workspace, terminal, transcript and receipts for inspection. Slow operations may exceed the client deadline: inspect status or recover the same request before acting again.
 
 ### Manual completion policy
 
-The lifecycle controller below verifies integration and prepares an evidence-backed owner handoff: **Merged — awaiting manual closure**. Both offline local-target and GitHub PR verification remain required. Installed dashboard/launcher cutover and the concrete omp adapter remain tracked separately in `herdr-beads-2hv`, `herdr-beads-8vu`, and `herdr-beads-rlm`; the existing launcher does not verify merges or generate closure handoffs.
+The lifecycle controller verifies integration and prepares an evidence-backed owner handoff: **Merged — awaiting manual closure**. Both offline LOCAL and genuine GitHub PR workflows are supported with separate authority; neither a finished turn nor local integration proves remote publication. Beads/Dolt remote synchronization is a separate operator-authorized action.
 
 The owner reviews the current canonical database, full issue ID, ownership/run/submission, target, and merge evidence, then separately executes normal `bd close --reason …` without `--force`. Manual closure retains Beads' existing concurrency limitations: it is not atomically guarded against reopen, reassignment, or a newer run. A Herdr lock or a preceding status check does not remove that race. Observing an externally closed issue is not proof that a particular run owned its closure.
 
@@ -185,7 +174,7 @@ This is a reusable agent prompt, not a transactional cleanup tool or a change to
 
 ## Durable local controller
 
-The version-1 controller includes a private JSON run store, concrete omp execution/workspace adapters, read-only integration observer, bounded Unix-socket request CLI, controller-connected omp startup extension, and installed launchd scheduler. Foreground `serve` and the installed service compose the adapters; installation does **not** yet wire legacy Start/Resume dashboard actions to controller runs or migrate legacy runs. Those cutovers remain separate. Only omp is supported; missing tools or capabilities refuse rather than substituting a harness or falling back to the legacy launcher.
+The version-1 controller includes a private JSON run store, concrete omp execution/workspace adapters, read-only integration observer, bounded Unix-socket request CLI, controller-connected omp startup extension and installed launchd scheduler. The installed dashboard uses these controller actions. Legacy history is adopted explicitly, never silently migrated. Policy is harness-neutral; shipped execution supports only omp and refuses missing capabilities without an alternate harness or standalone fallback.
 
 ```sh
 # With the launchd service installed/running: one request in, one response out.
@@ -197,7 +186,7 @@ The version-1 controller includes a private JSON run store, concrete omp executi
 
 Each socket message is one newline-terminated JSON object. Clients send the request and read the response without a write-side shutdown: the server may respond and close immediately, and on Darwin a subsequent `SHUT_WR` can fail with `ENOTCONN` even while the complete response remains buffered. Requests are not automatically retried.
 
-The controller retains the existing machine UUID independently of the retired launcher's name in `herdr-beads/machine-id`. Import uses fsynced, exclusive atomic publication; it never replaces an existing identity. Both canonical and legacy files are checked while present; a missing/invalid established identity or disagreement refuses startup. Only a genuinely fresh service install may create a UUID. Repository identity is the canonical checkout plus Git common directory, independently resolved canonical Beads directory, full issue ID, and machine. Linked worktrees resolve to the canonical source checkout; a clone-backed workspace needs the provider's independent registry/source validation.
+The controller retains the existing machine UUID in `herdr-beads/machine-id`. Import uses fsynced, exclusive atomic publication; it never replaces an existing identity. Both canonical and historical files are checked while present; a missing/invalid established identity or disagreement refuses startup. Only a genuinely fresh service install may create a UUID. Repository identity binds canonical checkout, Git common directory, independently resolved canonical Beads directory, full issue ID and machine. Linked worktrees resolve to the canonical source checkout; independent clones remain unsupported and retained/refused.
 
 ### Versioned requests and independent state
 
@@ -262,7 +251,7 @@ Each external step is journaled before execution and its observed receipt commit
 
 `bin/beads_omp.py:OmpExecution`, `bin/beads_workspace.py:OmpWorkspace`, and `bin/beads_herdr.py:HerdrHosting` are separate concrete dependencies, not a plugin framework. `create_adapters(executables)` supplies static service composition with explicit absolute executable paths; null tools never fall back to ambient PATH. Launch, writable/read-only exact resume, durable identity, owner activity, structured handoff, read-only enforcement and explicit release are supported. Control acknowledgements require the exact durable request, fence, binding, session, live PID, held lease and frozen extension gate. Recovery observes the retained request/receipt without rewriting or relaunching it.
 
-Before terminal creation, the adapter fsyncs an owner-only per-run/generation startup config and initial task outside the workspace under `${XDG_STATE_HOME:-~/.local/state}/herdr-beads/omp`. An interrupted or slow Herdr request reconnects by the exact `GO_BD_SESSION_CONFIG` value in the terminal's immutable creation argv, including the creation-to-labeling gap. Recovery never issues another terminal creation request. Unconfirmed operations retain their claims, workspace, transcript and terminal for inspection.
+Before terminal creation, the adapter fsyncs an owner-only per-run/generation startup config and initial task outside the workspace under `${XDG_STATE_HOME:-~/.local/state}/herdr-beads/omp`. New immutable creation argv carries `BEADS_OMP_SESSION_CONFIG`. Interrupted/slow requests reconnect by that exact config identity, including the creation-to-labeling gap, without another terminal creation. Recovery of an already-journaled historical creation may inspect its immutable `GO_BD_SESSION_CONFIG`; it is never supplied to a new launch. Unconfirmed operations retain all resources for inspection.
 
 Start/focus/resume recheck the canonical database, owner, blockers and workspace identity. Focus requires the acknowledged foreground omp PID and exact transcript lease, not a title or stale agent report. Ended terminals resume only the recorded absolute transcript with `--resume`, no fresh task or `--restore`; missing, foreign, conflicting or leased history refuses intact. Existing legacy associations require explicit adoption rather than a new-run overwrite.
 
@@ -272,7 +261,7 @@ Send `method:"adopt_legacy", params:{"expected":null}` with the same canonical s
 
 Sources are the exact `metadata.omp_session`, per-database `go-bd/<sha256(beadsDir)>/issue-<full-id>.json`, original launch config/ack, terminal creation argv, canonical `beads.project`/`beads.issue` labels, foreground omp PID, exact transcript lease, and independently validated omp workspace registry/Git backing. A live terminal requires agreement among these identities, not merely generic Herdr labels, a title or a recent transcript. Conflicting, malformed, foreign-machine, missing or orphaned resources refuse visibly and remain retained for explicit resolution. Malformed launch files in the project's legacy state conservatively block adoption even when their issue cannot be determined.
 
-An adopted live run focuses its existing terminal; repeating adoption focuses the same incarnation. An ended, unleased exact conversation is adopted stopped, without creating a terminal. A subsequent `resume` or `start_or_focus` reopens only the original transcript/workspace, without a fresh prompt. Repeated `adopt_legacy` on a retained inactive run uses that same exact-resume path. Original branch names and actual linked/clone backing are preserved; new workspace planning keeps its stricter issue/attempt naming checks.
+An adopted live run focuses its existing terminal; repeating adoption focuses the same incarnation. An ended, unleased exact conversation is adopted stopped, without creating a terminal. A subsequent `resume` or `start_or_focus` reopens only the original transcript/workspace, without a fresh prompt. Repeated `adopt_legacy` on a retained inactive run uses that same exact-resume path. Original linked branch identity is preserved. Independent-clone resources remain retained/refused; adoption does not bypass provider validation.
 
 Adopted runs start with `target:null`, no submissions/evidence, held release and `manual_cleanup_required`. Use `target:null` and the retained policy when focusing/resuming an unbound run with `start_or_focus`; null is refused for new attempts. Explicit `handoff` supplies mode/target and exact required submissions. Neither a remote nor a branch name chooses local-target versus PR mode. Adoption cannot produce merge proof, a manual closure command or cleanup permission.
 
@@ -281,16 +270,16 @@ The dashboard preserves an adopted run's null destination even when a project de
 Observed adoption validation (2026-11-09): two actual CLI/socket requests adopted/focused the running omp conversation `01a1c269-5da9-710c-a5b4-7f86278ef4b9` in terminal `t2n` using an isolated controller store. Transcript bytes, legacy JSON and the terminal set were unchanged; canonical linked backing and original branch were validated, and destination remained null. This is live adoption proof, not installed cutover or managed-PR integration acceptance.
 
 
-Workspace planning preserves the explicit integration target and branches new work from its already-local ref; no remote, fetch, push, PR creation or merge is required for local-target mode. Registry/source/common-dir/branch checks distinguish independent clones from linked workspaces; clone origin never selects the integration destination. Omp 18.17's copy-on-write “clone” provisioning still registers linked Git worktrees. Supported config queries can initialize omp settings storage, and `omp worktree add` runs the user's existing checkout hooks; the adapter itself issues no network or integration commands.
+Workspace planning preserves the explicit integration target and branches new work from its already-local ref; no remote, fetch, push, PR creation or merge is required for LOCAL mode. Registry/source/common-dir/branch checks reject unsupported independent clones; clone origin never selects the integration destination. Omp 18.17's copy-on-write “clone” provisioning still creates linked Git worktrees and is not independent-clone acceptance. Supported config queries can initialize omp settings storage, and `omp worktree add` runs existing checkout hooks; the adapter itself issues no network or integration commands.
 
 
 ### Omp session extension
 
-`bin/go-bd-session.mjs` is owned, implemented, and packaged by **herdr-beads**, not omp-core. `install.sh` copies it beside the legacy launcher at `~/.local/bin/go-bd-session.mjs` and packages the service copy beside its execution adapter at `${HERDR_BEADS_INSTALL_ROOT:-~/.local/share/herdr-beads-service}/bin/go-bd-session.mjs`. The concrete omp adapter loads that adjacent copy explicitly with `omp --extension /absolute/path/go-bd-session.mjs`. Its supported API baseline is [omp 18.17.0](https://github.com/can1357/oh-my-pi/blob/v18.17.0/docs/extensions.md): `ensureOnDisk`, `FileSessionStorage` leases, main/sub identity, lifecycle hooks, managed timers, async-job snapshots, and registered commands. There is no ambient discovery, second harness, or universal harness claim.
+`bin/beads_omp_session.mjs` is owned and packaged by **herdr-beads**, not omp-core. `install.sh` installs it only beside the execution adapter at `${HERDR_BEADS_INSTALL_ROOT:-~/.local/share/herdr-beads-service}/bin/beads_omp_session.mjs`. The adapter explicitly loads that adjacent file with `omp --extension /absolute/path/beads_omp_session.mjs`; no user-bin copy, ambient discovery or compatibility launcher is provided. Its API baseline is [omp 18.17.0](https://github.com/can1357/oh-my-pi/blob/v18.17.0/docs/extensions.md): durable storage/leases, main/sub identity, lifecycle hooks, managed timers, async-job snapshots and registered commands.
 
-This extension requires controller-v1 launch configuration. Do not deploy it with the old direct-mutation launcher: missing configuration or acknowledgement visibly terminates the session before startup work. Concrete adapters and service packaging are present; coordinated legacy dashboard/launcher cutover remains separate (`herdr-beads-rlm.4`). No legacy protocol fallback is provided.
+Controller-v1 configuration and acknowledgement are mandatory; missing/refused startup identity exits before startup work. Historical launch files are evidence only. `GO_BD_SESSION_CONFIG` may be read solely at explicit legacy adoption or recovery of an already-journaled immutable historical creation; new launches always supply `BEADS_OMP_SESSION_CONFIG`.
 
-`GO_BD_SESSION_CONFIG` names an absolute, owner-only JSON file in an owner-only directory outside the workspace. The adapter supplies:
+`BEADS_OMP_SESSION_CONFIG` names an absolute, owner-only JSON file in an owner-only directory outside the workspace. The adapter supplies:
 
 - `schemaVersion:1`, canonical `scope`, exact `fence`, private `bindingId`/`credential`, and absolute `controllerSocket`.
 - Canonical `worktree`, `previous` (exact prior `omp_session` or null), absolute startup `ack`, optional `prompt_file`, and `access` (`writable` or `read_only`).
@@ -341,7 +330,7 @@ The controller adapter writes `<config>.control.json` with `{fence,bindingId,req
 
 Idle/`agent_end` only reports turn attention while ownership remains active. `session_stop`, shutdown, and timers are not merge or release evidence. Shutdown skips a busy owner queue and otherwise spends at most 500 ms awaiting its exit notification; it releases the local lease without waiting for merge, issuing release, closing Beads, or deleting anything. The durable binding remains available for independent process/lease reconciliation after a missed notification.
 
-Observed extension validation: actual omp 18.17.0 TUI context/handoff/release commands against an isolated local protocol peer, actual persistent transcript/lease handling, and delayed startup with a six-second acknowledgement before the launcher receipt. Earlier real metadata-mirror validation preceded its transfer to the controller execution adapter. This is adapter-surface evidence, not production-controller/Herdr cutover or genuine managed-PR merge acceptance.
+Historical extension evidence (before controller-only cutover): actual omp 18.17.0 TUI context/handoff/release commands exercised a local protocol peer, persistent transcript/lease handling and delayed six-second acknowledgement. Earlier metadata-mirror validation preceded its transfer to the execution adapter. This is adapter-surface evidence only, not post-removal installed proof.
 
 
 ### Integration evidence and manual owner handoff
@@ -366,19 +355,15 @@ Before executing the command separately, the operator reviews current database/i
 
 External manual closure is only `closure.state:"observed_closed"`; the controller does not assert closure ownership or issue/retry a close. Reopen, reassignment, changed submissions and target resets revoke/invalidate old proof rather than reclose. Cleanup stays `held` with `manual_cleanup_required` after integration, closure and release. No workspace, branch, registry, session or terminal cleanup method exists here.
 
-Observed validation includes deterministic recovery/concurrency/refusal tests, actual socket/CLI delayed-operation recovery, offline local fast-forward proof, and genuine read-only GitHub PR evidence ([cli/cli#8294](https://github.com/cli/cli/pull/8294)) surviving store reopen. The latter remains observer verification, **not** managed-project PR/cutover acceptance.
+### Historical pre-cutover evidence
 
-Concrete adapter smoke (2026-11-09, omp 18.17): actual Herdr start → focus → killed-terminal exact resume retained workspaces, transcript IDs, token recall and unrelated metadata for both a no-remote `local-target` (`refs/heads/integration-local`) and an explicitly configured `github-pr` target (`cli/cli`, stable repository ID `212613049`, `refs/heads/trunk`). The socket service was reopened without losing either run. A focus exceeding the client deadline reconnected to the same succeeded operation. This proves execution/target retention, not creation/merge of a managed PR or installed dashboard/extension cutover.
+Earlier isolated controller/observer smoke exercised socket recovery/concurrency refusals, no-remote local normal/fast-forward integration, trusted squash receipts and reset invalidation, plus genuine read-only provider observations for [merge](https://github.com/kubernetes/kubernetes/pull/143983), [squash](https://github.com/python/cpython/pull/161674), [rebase](https://github.com/zulip/zulip/pull/40635) and [cli/cli#8294](https://github.com/cli/cli/pull/8294). Herdr start/focus/exact resume retained transcripts, token recall and metadata. Disposable manual closure/reopen and service restart retained resources; externally missing or unregistered workspaces remained held, not cleaned up.
 
-Additional observer acceptance exercised real offline normal/fast-forward merges and exact local squash receipts (including reset invalidation), plus genuine provider records for [merge](https://github.com/kubernetes/kubernetes/pull/143983), [squash](https://github.com/python/cpython/pull/161674) and [rebase](https://github.com/zulip/zulip/pull/40635). These are independent adapter observations, not a claim that this project's run was merged or that managed-project/UI cutover passed.
+Source-dashboard smoke used an isolated controller and separately named native mod, including [NVIDIA/OpenShell#5077](https://github.com/NVIDIA/OpenShell/pull/5077) read-only evidence. It exercised structured handoff, copy-only closure, tab recreation and independent local/provider holds. Initial-render checks and source screenshots are historical surface evidence, not production pointer-dispatch or post-removal acceptance. A later retention screenshot attempt returned a stale frame/black capture and supplies no visual proof.
 
-Manual-handoff smoke additionally exercised a real disposable Beads database: offline verified integration → stable command after restart/reconciliation → separately executed normal owner close → observed external closure → reopen without reclosure, retaining the workspace. A genuine read-only [cli/cli#8294](https://github.com/cli/cli/pull/8294) submission imported into a disposable checkout produced the PR handoff and survived restart. Actual omp 18.17 TUI `/bead-context` rendered its verified status, concurrency warning and copyable command without a model turn or closure action. These are disposable policy/presentation acceptance tracks, not creation/merge of a new managed-project PR or installed dashboard cutover.
+These historical observations do not assert current test totals, independent-clone support, or installed controller-only cutover proof. The installed disposable evidence below is retained with its original scope; final post-removal evidence is separate.
 
-Retention smoke (2026-11-10) used two isolated real Beads databases and the actual socket service: offline local-target verification and genuine read-only [cli/cli#8294](https://github.com/cli/cli/pull/8294) evidence both reached manual handoff. Separate fixture-owner closure removed the issues from open lists; service restart retained their directories, Git registrations and byte-identical transcript files. An external rename of the disposable local directory produced `missing`/`held`, retained its exact stale registration and still recorded external closure. Plain Git worktrees outside the provider's source registry reported actionable `unknown`, not cleanup success. Service regressions also cover linked and independent-clone backing in both modes, explicit release, dirty/untracked/ignored work, stashes, nested repositories and changed identity.
-
-All three source native mods passed initial-render checks. A dedicated source retention pane opened without app errors, but the native screenshot API returned a stale pre-smoke frame and desktop capture was black; this run does not claim visual acceptance or an installed dashboard cutover.
-
-### Installed disposable acceptance — 2026-11-10
+### Historical installed disposable acceptance — 2026-11-10
 
 `herdr-beads-rlm.3` exercised separately provisioned installed service packages (`--no-start`), isolated real Beads databases, actual Herdr windows/cores and omp 18.17.0. App, service and core used matching `XDG_STATE_HOME`/`HERDR_APP_HOME`; mismatched environments correctly refused startup rather than adopting another terminal. Production installations, issues, PRs and workspaces were not used for destructive proof. No source commit, git push, Dolt remote sync, workspace removal or automatic closure occurred.
 
@@ -386,7 +371,7 @@ All three source native mods passed initial-render checks. A dedicated source re
 |---|---|---|
 | LOCAL, linked | No remotes; canonical `refs/heads/master`; configured `gh` unavailable. Real start/focus, exact writable/read-only resume, token recall, structured handoff, normal/fast-forward integration, missing/trusted squash receipt, target-reset invalidation, concrete read-only/release acknowledgement, app-closed ordinary owner closure, SIGKILL/service recovery, reopened/reassigned ownership and extra-work retention. | `/Users/rodrigosetti/.local/state/hr3-b62senr0/local-evidence-summary.json`; native retained-run screenshot `local-retained-inspection.png`. |
 | PR, linked | Genuine new private [disposable repository](https://github.com/rodrigosetti/herdr-manual-pr-20261110-172452-8ef3b2), stable repository ID `1452974756`, base `refs/heads/main`. Real omp start/focus/resume/token recall, full required PR coverage including merge/squash/rebase, handoff/release, app-closed ordinary owner closure and restart retention passed. Wrong head/base, closed-unmerged, per-process HTTP 401 and refused HTTPS-proxy failures withheld proof/commands. | `/private/tmp/herdr-real-pr-ce4e8bcac7/pr-evidence-summary.json`, `stacked-merged-status.json`, `manual-close-results.json`, `final-restart-statuses.json`, `retained-resource-evidence.json`. |
-| Independent clone | **Blocked, not accepted.** A genuine no-remote clone was retained and visibly refused before launch: actual `omp worktree list --json` classified it as an unbound stray; controller returned `workspace_mismatch`. Linked copy-on-write provisioning is not independent-clone backing. | LOCAL fixture `clone-real-provider-refusal.json`; prerequisite **`herdr-beads-rlm.5`**. |
+| Independent clone | **Unsupported, not accepted.** A genuine no-remote clone was retained and visibly refused before launch: actual `omp worktree list --json` classified it as an unbound stray; controller returned `workspace_mismatch`. Linked copy-on-write provisioning is not independent-clone backing. | LOCAL fixture `clone-real-provider-refusal.json`; separate provider capability work is tracked in `herdr-beads-rlm.5`, not a linked-only cutover prerequisite. |
 
 Exact LOCAL identity: `rlmlocal-whu`, run `da65d791-1f59-4747-9f6a-bd93b0b97e9c`, integration generation 2, session `01a1c680-025f-70c9-a4cc-dfd65108402b`, submitted `cab1115d32e7575403e5981c9ee1ffc806c1b629`; normal result `5a24d341b39fb29901f0aec31e1a8caa814ae156`, reviewed squash result `d9042b27b3afed3d776a468dec4ba164782cb6b5`. The trusted receipt was independently verified; the socket refused owner attestation. Separate fast-forward fixture `rlmlocal-z0d` integrated `e3c01f0a2162bf48c5616d47efd91e6b2e67b2f7` and retained its exact conversation through explicit read-only resume before release/closure.
 
@@ -394,11 +379,26 @@ Exact PR identity: `prfixture-dgm`, run `f747b0a6-3e0b-483c-8f8f-d1f9c8357787`, 
 
 Real failure/recovery exposed and fixed missing concrete release/read-only support, loss of visible extra-work diagnostics after external closure, and invalid released activity during reopen/reassignment. Closed retained runs now expose `dirty` and `unpushed_or_unpreserved` blockers plus current/submitted HEAD diagnostics; released sessions remain inactive after ownership revocation. Missing `omp` visibly refused launch, exact resume and release; unsupported harness and cleanup requests also refused without substitutes or removal. Ordinary manual closure remains **not revision/run guarded**; no atomic stale-state rejection is claimed.
 
-Validation: the full Python suite passed 279 tests and Node passed 59 tests; after the final released-revocation correction, all 6 affected retention tests passed. Existing launcher/model regressions were retained. Final real installed CLI observations showed released/inactive sessions, one externally closed retained PR fixture and one externally reopened/reassigned fixture without a closure command. Earlier failed-operation diagnostics remain in the durable journal/service health for inspection; successful recovery does not erase that history.
+Historical validation at that stage: the full Python suite passed 279 tests and Node passed 59 tests; after the released-revocation correction, all 6 affected retention tests passed. Then-existing launcher/model regressions were retained at that stage; these are not current post-removal test totals. Final installed observations retained released/inactive sessions, an externally closed PR fixture and an externally reopened/reassigned fixture without a closure command. Recovery did not erase earlier failed-operation journal/health diagnostics.
 
-The native dashboard rendered closed retained resources and their blockers separately from open issues; actual omp rendered context/handoff/release acknowledgements. This was not production dashboard cutover or exhaustive pointer dispatch. Machine-wide sleep, production app quit, real account credential revocation and router/firewall failure were not exercised; only isolated apps were quit and outages were per-process. The [omp 18.17 scanner](https://github.com/can1357/oh-my-pi/blob/v18.17.0/packages/coding-agent/src/cli/worktree-cli.ts) recognizes PR checkouts through `.git` files and supplies no public independent-clone registration command. Do not forge that binding or relax identity checks. The owner requested implementation commit/merge/closure after this limitation was disclosed. Independent LOCAL acceptance remains outstanding in `herdr-beads-rlm.5`, which directly blocks cutover `herdr-beads-rlm.4`; closing the implementation issue does not assert clone acceptance or authorize combined cutover.
+The native dashboard rendered closed retained resources and their blockers separately from open issues; actual omp rendered context/handoff/release acknowledgements. This historical acceptance predates the installed controller-only cutover and is not post-removal proof or exhaustive pointer dispatch. Machine-wide sleep, production app quit, real account credential revocation and router/firewall failure were not exercised; only isolated apps were quit and outages were per-process. The [omp 18.17 scanner](https://github.com/can1357/oh-my-pi/blob/v18.17.0/packages/coding-agent/src/cli/worktree-cli.ts) supplies no public independent-clone registration command. Do not forge that binding or relax checks: linked-only support deliberately retains/refuses independent clones.
 
 
+
+### Controller-only installed cutover — 2026-11-10
+
+Production installation now runs `com.herdr.beads` with the controller-backed mods and concrete renamed omp extension. Owned user-bin launcher/extension/epic-helper copies are absent; their ownership hashes and original bytes are retained in `~/.local/state/herdr-beads/install-cutover.json` and its installation receipts. All 99 historical legacy state files and both recorded transcript prefixes remained unchanged. The already-running `.4` session was adopted/focused in terminal `t3f` without relaunch or destination inference; production screenshot: `/Users/rodrigosetti/.local/state/rlm4-n591qmf8/production-controller.png`.
+
+Final retained evidence: `/Users/rodrigosetti/.local/state/rlm4-n591qmf8/post-retirement-evidence.json` and `controller-requests.json`. Both linked-only tracks exercised installed sidebar Start, focus without duplication, exact resume/token recall, package upgrade with durable run/session preservation, another exact resume, structured extension handoff, verified integration/read-only acknowledgement, native copy-only closure command, explicit release, ordinary external fixture-owner closure, app-closed service restart, observed closure and retained registered workspace/transcript/terminal resources.
+
+| Track | Exact post-removal identity and proof |
+|---|---|
+| LOCAL | `cutlocal-48i`; run `804eecbd-9a11-4a52-9ac8-b08946f1bebb`, generation 3; session `01a1c6ba-4bbc-77e5-885e-dfdbbdd08def`. No remotes and configured `gh:null`; canonical `refs/heads/master` independently verifies existing fast-forward source/target `e3c01f0a2162bf48c5616d47efd91e6b2e67b2f7`. |
+| GitHub PR | `cutpr-d2w`; run `dbecedf4-736d-4ede-9989-00d6064284a3`, generation 3; session `01a1c6ba-4a3f-7707-b21f-68f7db4bcb59`. Genuine fresh provider observation of [fixture PR 5](https://github.com/rodrigosetti/herdr-manual-pr-20261110-172452-8ef3b2/pull/5), repository ID `1452974756`, base `refs/heads/main`, head `1d08a9fc2b24f6240e93cd989a58a719840863d3`, merge result `912dc265eead335391d2e0cd8e297ceb928d67f0`. |
+
+This representative repeat reverified earlier genuine integrated revisions; it performed no new merge, fetch, push or publication. Both runs ended `observed_closed`, `released/inactive`, workspace observation `present`, cleanup `held/manual_cleanup_required`, with no closure command. Normal manual closure was executed only by the fixture-owner terminal outside integration code. Native handoff screenshots live in each track's `verified-manual-handoff.png`; bounded UI timeouts stayed visible and same-request recovery was exercised. Pointer dispatch, machine sleep and production app quit were not tested. Initial stale startup frames are not visual acceptance evidence.
+
+Validation: 260 lifecycle/adapter/service Python tests plus 43 installer tests passed; 61 Node tests passed. All three installed native mods passed checks in production and both fixtures. Only disposable observer processes/apps were stopped after recovery proof; their resources remain retained. Production service, live conversation and `.4` issue remain active. The installed source is the dedicated `.4` worktree; source commit/integration is owner-controlled and not performed here. Do not reinstall from an older canonical `main` before integrating the cutover.
 
 ## Verification
 
@@ -408,7 +408,6 @@ herdr-app check ~/.config/herdr-app/mods/beads-dashboard
 herdr-app check ~/.config/herdr-app/mods/bead-detail
 herdr-app check ~/.config/herdr-app/mods/beads-sidebar
 node --test model.test.mjs lifecycle.test.mjs session.test.mjs
-python3 launcher_test.py
 python3 -m unittest epic_test
 python3 -m unittest discover -p '*_test.py'
 ```
@@ -423,5 +422,5 @@ The action queue drains in a dashboard-owned native timer callback every 50 ms; 
 
 For navigation, follow parent/dependent/child IDs, including a closed or filtered-out issue under folded ancestors. Verify that the target is highlighted and scrolled into view without inflating filter counts. Use Back/Forward across both list and relationship selections, then go Back and choose a new bead to confirm that Forward becomes unavailable. Re-selecting the current bead must not add a history step.
 
-For persistence changes, use an isolated project to start a real session, remember a unique token, terminate the terminal, and resume. Verify the same session ID and worktree, token recall without resending it, preservation of unrelated metadata, live-session focus without duplication, and visible errors for missing transcripts or a different machine. Exercise both direct and Herdr launches and observe the dashboard's Start → Go to session → Resume transitions.
+For persistence changes, use an isolated project to start a real session, remember a unique token, terminate the terminal and exact-resume through controller actions. Verify the same session ID/worktree, token recall without resending it, preservation of unrelated metadata, focus without duplication and explicit missing-transcript/foreign-machine refusals. Exercise installed dashboard and session extension with both offline LOCAL and genuine GitHub PR tracks; neither track substitutes for the other.
 

@@ -3,6 +3,7 @@ import { v_flex, h_flex, v_virtual_list, VirtualListScrollHandle, Scrollbar, Tex
 import { agents, exec, focused, home, nextCommand, panes, props, run, setShared, shared, spaces, terminals, theme } from "herdr";
 import { issueAction, issueRows, issueSessions, sessionLabels, statusLabels } from "./model.js";
 import { lifecycleLabel, targetLabel, lifecycleMarkdown, manualClosureCommand, retainedRuns } from "./lifecycle.js";
+import installation from "./installation.js";
 
 function preferences(key) {
   try { return JSON.parse(localStorage.getItem(key) ?? "{}"); } catch { return {}; }
@@ -15,7 +16,7 @@ function checked(result, label) {
 
 export default class BeadsDashboard extends View {
   init(_props, cx) {
-    const target = props() ?? {}, focus = focused();
+    const target = { ...installation, ...(props() ?? {}) }, focus = focused();
     const space = spaces().find((item) => item.id === focus?.space);
     const tabIds = new Set(space?.tabs.map((tab) => tab.id) ?? []);
     this.folder = target.folder || panes().find((pane) => tabIds.has(pane.tab) && pane.cwd)?.cwd || space?.folder;
@@ -44,7 +45,6 @@ export default class BeadsDashboard extends View {
     this.operationError = "";
     this.reconciliationError = "";
     this.notice = "";
-    this.namingError = "";
     this.loading = false;
     this.loaded = false;
     this.starting = new Set();
@@ -224,14 +224,6 @@ export default class BeadsDashboard extends View {
         for (const issue of issues) if (issue.status === "blocked") this.blocked.add(issue.id);
         this.ready = new Set(ready.map((issue) => issue.id));
         this.loaded = true;
-        if (!this.machine) {
-          try {
-            const naming = checked(await exec("go-bd", ["--reconcile-spaces", "--json"], { cwd: this.project.folder }), "Space labels");
-            this.namingError = naming.errors.map((error) => error.error).join("\n");
-          } catch (error) {
-            this.namingError = String(error.message ?? error);
-          }
-        }
         this.updated = new Date().toLocaleTimeString();
         this.error = "";
       } catch (error) {
@@ -326,7 +318,7 @@ export default class BeadsDashboard extends View {
   select(id, cx) {
     if (!this.project || ![...this.issues, ...this.navigationIssues].some((issue) => issue.id === id)) return;
     const dashboard = this.ownPane();
-    if (!dashboard) { this.error = "Dashboard pane not found. Open it as a tab with go-bd --dashboard."; cx.notify(); return; }
+    if (!dashboard) { this.error = "Dashboard pane not found. Open Beads using the sidebar in a project space."; cx.notify(); return; }
     this.tab = dashboard.tab;
     this.selected = id;
     const selection = `beads.selection.${this.tab}`;
@@ -560,6 +552,7 @@ export default class BeadsDashboard extends View {
         .child(h_flex().flex_wrap().gap(8)
           .when(!!this.pendingRequests[this.lifecycleId] && this.service.available, (element) => element.child(this.button("recover-request", "Recover same request", (cx) => this.operate(this.lifecycleId, "recover", cx), t)))
           .when(enabled("start_or_focus"), (element) => element.child(this.button("lifecycle-start", current ? "Focus / resume omp" : "Start omp", (cx) => this.launch(this.lifecycleId, cx), t)))
+          .when(enabled("adopt_legacy"), (element) => element.child(this.button("lifecycle-adopt", "Adopt existing session — preserve history", (cx) => this.operate(this.lifecycleId, "adopt_legacy", cx), t)))
           .when(enabled("resume"), (element) => element.child(this.button("lifecycle-resume", "Exact resume", (cx) => this.operate(this.lifecycleId, "resume", cx), t)))
           .when(enabled("handoff"), (element) => element.child(this.button("lifecycle-handoff", current?.target?.mode === "github-pr" ? "Submit PR handoff" : "Submit explicit handoff", (cx) => this.prepareHandoff(cx), t)))
           .when(enabled("reconcile"), (element) => element.child(this.button("lifecycle-reconcile", "Verify integration", (cx) => this.operate(this.lifecycleId, "reconcile", cx), t))))
@@ -612,11 +605,10 @@ export default class BeadsDashboard extends View {
           .child(this.button("filter-all", `All open · ${counts.all}`, (cx) => this.setMode("all", cx), t, this.mode === "all"))
           .child(this.button("filter-ready", `Ready · ${counts.ready}`, (cx) => this.setMode("ready", cx), t, this.mode === "ready" && !this.lifecycleOpen))
           .child(this.button("filter-lifecycle", `Lifecycle · ${retainedRuns([...this.lifecycle.values()]).length}`, (cx) => { this.lifecycleOpen = !this.lifecycleOpen; cx.notify(); }, t, this.lifecycleOpen)))
-        .child(div().text_size(11).text_color(t.muted).child("Supported execution: omp only · Herdr agent compatibility does not imply lifecycle support."))
+        .child(div().text_size(11).text_color(t.muted).child("Execution: omp only · separate omp worktree registry required · linked Git workspaces only."))
         .child(div().text_size(11).text_color(t.muted).child(this.loaded ? `${count} ${count === 1 ? "issue" : "issues"} · ${sessions.size} with agent attention` : "Loading project…")))
       .when(!!this.error, (element) => element.child(div().flex_none().px(16).py(10).bg(t.surface).text_color(t.blocked).child(`${this.error}${this.loaded ? " — showing last successful refresh" : ""}`)))
-      .when(!!this.reconciliationError, (element) => element.child(div().flex_none().px(16).py(10).bg(t.surface).text_color(t.blocked).child(`Epic reconciliation failed: ${this.reconciliationError}`)))
-      .when(!!this.namingError, (element) => element.child(div().flex_none().px(16).py(10).bg(t.surface).text_color(t.blocked).child(`Space label reconciliation failed: ${this.namingError}`)))
+      .when(!!this.reconciliationError, (element) => element.child(div().flex_none().px(16).py(10).bg(t.surface).text_color(t.blocked).child(`Service reconciliation failed: ${this.reconciliationError}`)))
       .when(!this.service.available, (element) => element.child(div().flex_none().px(16).py(10).bg(t.surface).text_color(t.blocked)
         .child(`${this.service.error?.message ?? this.service.error ?? "Lifecycle service unavailable."} — lifecycle snapshot is last-good/read-only; browsing remains available. No local-launch fallback.`)))
       .when(!!this.operationError, (element) => element.child(div().flex_none().px(16).py(10).bg(t.surface).text_color(t.blocked).child(`Lifecycle operation: ${this.operationError}`)))

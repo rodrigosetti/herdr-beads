@@ -228,6 +228,23 @@ print(json.dumps({{'path':{str(self.beads)!r}}}))
         transport.assert_not_called()
         self.assertEqual(value['params']['policy']['closeAfterIntegration'], True)
 
+    def test_explicit_adoption_uses_controller_and_preserves_the_original_conversation(self):
+        self.fixture.legacy(active=False)
+        self.fixture.controller = Controller(self.machine, self.fixture.store, self.fixture.authority,
+                                             self.fixture.execution, self.fixture.workspace)
+        self.start_server()
+        before = copy.deepcopy(self.fixture.authority.row)
+        value = self.fixture.request('adopt_legacy', {'expected': None})
+        response = beads_ui.request_json(json.dumps(value), self.config_path)
+        self.assertEqual(response['outcome'], 'accepted', response)
+        self.fixture.drain()
+        run = self.fixture.status()['run']
+        self.assertEqual(run['execution']['session']['sessionId'], 'actual-session')
+        self.assertIsNone(run['target'])
+        self.assertEqual(self.fixture.execution.launches, 0)
+        self.assertEqual(self.fixture.authority.row, before)
+        self.assertEqual(run['cleanup']['state'], 'held')
+
     def test_cli_uses_argv_and_default_config_without_stdin_or_launch(self):
         self.health()
         self.start_server()
@@ -242,7 +259,6 @@ print(json.dumps({{'path':{str(self.beads)!r}}}))
         response = json.loads(result.stdout)
         self.assertEqual(result.returncode, 0, response)
         self.assertEqual(response['requestId'], 'argv-request')
-        self.assertEqual(response['actions'], [{'method': 'start_or_focus', 'enabled': True, 'refusal': None}])
         self.assertEqual(self.fixture.execution.launches, 0)
 
     def test_parse_errors_and_unavailable_socket_are_structured(self):

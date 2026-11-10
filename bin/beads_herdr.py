@@ -66,7 +66,7 @@ class HerdrHosting:
         self.call(['hc', 'label', address, *[f'{key}={value}' for key, value in self.labels(run).items()],
                    '--json'])
 
-    def find_operation(self, run, config_path, *, address=None):
+    def find_operation(self, run, config_path, *, address=None, config_env='BEADS_OMP_SESSION_CONFIG'):
         # The immutable creation argv carries this exact operation's config path,
         # even if the app reply or subsequent labeling was interrupted.
         rows = ([{'address': address}] if address is not None else
@@ -74,7 +74,7 @@ class HerdrHosting:
         if not isinstance(rows, list):
             raise Refusal('terminal_mismatch', 'Herdr returned no terminal list.')
         matches = []
-        marker = f'GO_BD_SESSION_CONFIG={config_path}'
+        marker = f'{config_env}={config_path}'
         for row in rows:
             address = row.get('address')
             if not address or '/' in address:

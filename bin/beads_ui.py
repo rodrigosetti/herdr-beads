@@ -20,7 +20,7 @@ from beads_identity import command, configure_executables, executable, machine_i
 from beads_service import load_config, private_json
 from beads_transport import TransportError, error_response, read_input, request as transport_request
 
-UI_METHODS = frozenset(('status', 'start_or_focus', 'resume', 'handoff', 'release', 'reconcile'))
+UI_METHODS = frozenset(('status', 'adopt_legacy', 'start_or_focus', 'resume', 'handoff', 'release', 'reconcile'))
 
 
 def default_config_path():
@@ -159,7 +159,7 @@ def request_json(text, config_path=None):
         if not isinstance(request_id, str) or not request_id:
             request_id = None
         if value.get('method') not in UI_METHODS:
-            raise Refusal('invalid_request', 'Dashboard methods are limited to status/start_or_focus/resume/handoff/release/reconcile; no closure, receipt, observation or cleanup execution.')
+            raise Refusal('invalid_request', 'Dashboard methods are limited to status/adopt_legacy/start_or_focus/resume/handoff/release/reconcile; no closure, receipt, observation or cleanup execution.')
         if value.get('apiVersion') != 1:
             raise Refusal('unsupported_version', 'Use apiVersion 1.')
         validate('controller', value, 'Request')

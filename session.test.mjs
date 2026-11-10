@@ -4,7 +4,7 @@ import { createServer } from "node:net";
 import { once } from "node:events";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync, openSync, fsyncSync, closeSync, rmSync, chmodSync } from "node:fs";
 import { join } from "node:path";
-import sessionExtension from "./bin/go-bd-session.mjs";
+import sessionExtension from "./bin/beads_omp_session.mjs";
 
 const clone = value => JSON.parse(JSON.stringify(value));
 const readJSON = path => JSON.parse(readFileSync(path, "utf8"));
@@ -48,8 +48,8 @@ async function fixture(t, options = {}) {
   }
   writeTranscript();
 
-  const oldConfig = process.env.GO_BD_SESSION_CONFIG;
-  process.env.GO_BD_SESSION_CONFIG = configPath;
+  const oldConfig = process.env.BEADS_OMP_SESSION_CONFIG;
+  process.env.BEADS_OMP_SESSION_CONFIG = configPath;
   const exit = t.mock.method(process, "exit", code => { throw new ExitRequested(code); });
   const stderr = t.mock.method(console, "error", () => {});
   const requests = [];
@@ -154,8 +154,8 @@ async function fixture(t, options = {}) {
   t.after(async () => {
     for (const socket of sockets) socket.destroy();
     if (server.listening) await new Promise(resolve => server.close(resolve));
-    if (oldConfig === undefined) delete process.env.GO_BD_SESSION_CONFIG;
-    else process.env.GO_BD_SESSION_CONFIG = oldConfig;
+    if (oldConfig === undefined) delete process.env.BEADS_OMP_SESSION_CONFIG;
+    else process.env.BEADS_OMP_SESSION_CONFIG = oldConfig;
     exit.mock.restore();
     stderr.mock.restore();
     rmSync(root, { recursive: true, force: true });
@@ -233,6 +233,34 @@ function assertRetained(run) {
   assert.equal(run.cleanup.state, "held");
 }
 const isolated = { concurrency: false, timeout: 10000 };
+
+test("controller extension never falls back to the legacy startup environment", isolated, async t => {
+  const h = await fixture(t);
+  const legacy = process.env.GO_BD_SESSION_CONFIG;
+  t.after(() => {
+    if (legacy === undefined) delete process.env.GO_BD_SESSION_CONFIG;
+    else process.env.GO_BD_SESSION_CONFIG = legacy;
+  });
+  process.env.GO_BD_SESSION_CONFIG = process.env.BEADS_OMP_SESSION_CONFIG;
+  delete process.env.BEADS_OMP_SESSION_CONFIG;
+  assert.throws(() => h.client(), ExitRequested);
+  assert.deepEqual(h.requests, []);
+  assert.deepEqual(h.leases.claims, []);
+});
+
+test("controller startup ignores an inherited legacy environment", isolated, async t => {
+  const h = await fixture(t);
+  const legacy = process.env.GO_BD_SESSION_CONFIG;
+  t.after(() => {
+    if (legacy === undefined) delete process.env.GO_BD_SESSION_CONFIG;
+    else process.env.GO_BD_SESSION_CONFIG = legacy;
+  });
+  process.env.GO_BD_SESSION_CONFIG = "/retired/legacy-configuration.json";
+  const primary = h.client();
+  await primary.emit("session_start");
+  assert.equal(h.ack().session.session_id, h.identity.session_id);
+  assert.equal(h.leases.held, true);
+});
 
 test("owner context suppresses stale commands and handoff proof outside awaiting_manual and accepts older records", isolated, async t => {
   const h = await fixture(t);
@@ -349,7 +377,7 @@ test("mismatched, previously associated, and leased transcripts cannot acquire o
       assert.equal(h.ack().session, undefined);
       assert.equal(h.emit("tool_call").block, true);
       assert.equal(h.controllerState().execution.session, null);
-      assert.deepEqual(readJSON(process.env.GO_BD_SESSION_CONFIG).previous, h.config.previous);
+      assert.deepEqual(readJSON(process.env.BEADS_OMP_SESSION_CONFIG).previous, h.config.previous);
       assert.equal(h.leases.held, false);
     });
   }

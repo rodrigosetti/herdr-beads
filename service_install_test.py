@@ -1,10 +1,13 @@
 """Isolated launchd packaging tests: no real launchctl, pip, or service process."""
 import contextlib
+import fcntl
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import plistlib
+import shutil
 import stat
 import subprocess
 import sys
@@ -20,6 +23,7 @@ from beads_identity import machine_id
 
 class ServiceInstallTests(unittest.TestCase):
     def setUp(self):
+        self.node = shutil.which("node")
         self.temporary = tempfile.TemporaryDirectory(prefix="beads service tests ")
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name).resolve()
@@ -28,6 +32,18 @@ class ServiceInstallTests(unittest.TestCase):
         (self.source / "schemas/v1").mkdir(parents=True)
         (self.source / "bin/beads_service.py").write_text("# packaged service\n")
         (self.source / "bin/beads_contract.py").write_text("# packaged dependency\n")
+        (self.source / "bin/beads_ui.py").write_text("# packaged UI bridge\n")
+        (self.source / "bin/beads_omp_session.mjs").write_text("export default function () {}\n")
+        for name in ("beads_epics.py", "beads_presentation.py"):
+            (self.source / "bin" / name).write_text(f"# packaged {name}\n")
+        for mod in installer.MODS:
+            folder = self.source / "mods" / mod
+            folder.mkdir(parents=True)
+            (folder / "mod.json").write_text(json.dumps({"name": mod}))
+            (folder / "main.js").write_text(f"// controller mod {mod}\n")
+        (self.source / "layouts").mkdir()
+        (self.source / "layouts/beads-workspace.json").write_text('{"controller":true}\n')
+        (self.source / "layouts/beads-workspace.svg").write_text("<svg/>\n")
         (self.source / "bin/herdr-beads").write_text("#!/usr/bin/env python3\n")
         (self.source / "schemas/v1/run.json").write_text('{"type":"object"}')
         (self.source / "requirements.txt").write_text("jsonschema>=4.18,<5\nreferencing>=0.30\n")
@@ -41,6 +57,7 @@ class ServiceInstallTests(unittest.TestCase):
             "HERDR_BEADS_INSTALL_ROOT": str(self.base / "installed package"),
             "HERDR_BEADS_STATE_HOME": str(self.base / "state home"),
             "HERDR_BEADS_LAUNCH_AGENTS": str(self.base / "Launch Agents"),
+            "HERDR_BEADS_BIN_HOME": str(self.base / "user bin"),
             "XDG_CONFIG_HOME": str(self.base / "config home"),
             "HERDR_APP_HOME": str(self.base / "Herdr app"),
             "PATH": str(self.tools), "BEADS_DIR": "/must/not/inherit", "SECRET_TOKEN": "not-for-launchd",
@@ -142,6 +159,14 @@ class ServiceInstallTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(identity.stat().st_mode), 0o600)
         self.assertFalse((self.paths.state_home / "go-bd").exists())
         self.assertEqual(machine_id(state_home=self.paths.state_home), identity.read_text().strip())
+        extension = self.paths.root / "bin/beads_omp_session.mjs"
+        self.assertEqual(extension.read_bytes(), (self.source / "bin/beads_omp_session.mjs").read_bytes())
+        self.assertFalse((self.paths.root / "bin/go-bd-session.mjs").exists())
+        self.assertFalse(self.paths.bin_home.exists())
+        for mod in installer.MODS:
+            self.assertEqual((self.paths.app / "mods" / mod / "main.js").read_bytes(),
+                             (self.source / "mods" / mod / "main.js").read_bytes())
+        self.assertEqual(json.loads(self.paths.journal.read_text())["phase"], "provisioned-no-start")
 
     def test_reinstall_preserves_projects_identity_logs_and_state(self):
         first = self.project("first repository")
@@ -206,17 +231,13 @@ class ServiceInstallTests(unittest.TestCase):
     def test_legacy_machine_identity_is_copied_without_regeneration_or_retirement(self):
         legacy = self.identity_file(legacy=True)
         original = legacy.read_bytes()
-        with patch.object(installer.uuid, "uuid4") as generate:
-            self.install()
-        generate.assert_not_called()
+        self.install()
         canonical = self.paths.state / "machine-id"
         self.assertEqual(canonical.read_bytes(), original)
         self.assertEqual(legacy.read_bytes(), original)
         self.assertEqual(machine_id(state_home=self.paths.state_home), original.decode().strip())
         legacy.unlink()
-        with patch.object(installer.uuid, "uuid4") as generate:
-            self.install()
-        generate.assert_not_called()
+        self.install()
         self.assertEqual(machine_id(state_home=self.paths.state_home), original.decode().strip())
         self.assertEqual(canonical.read_bytes(), original)
 
@@ -435,6 +456,300 @@ class ServiceInstallTests(unittest.TestCase):
         with patch.object(installer, "install", side_effect=installer.InstallError("bootstrap failure")), contextlib.redirect_stderr(io.StringIO()) as stderr:
             self.assertEqual(installer.main(["install", "--no-start"]), 1)
             self.assertIn("bootstrap failure", stderr.getvalue())
+
+
+    def legacy_copy(self, name="go-bd", *, packaged=False):
+        path = (self.paths.root / "bin" if packaged else self.paths.bin_home) / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = f"integration-owned fixture {name}\n".encode()
+        path.write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        hashes = {key: set(value) for key, value in installer.LEGACY_HASHES.items()}
+        hashes[name].add(digest)
+        allowance = patch.object(installer, "LEGACY_HASHES", hashes)
+        allowance.start()
+        self.addCleanup(allowance.stop)
+        return path, data
+
+    def test_installed_dashboard_module_uses_isolated_controller_paths(self):
+        if not self.node:
+            self.skipTest("Node is required to exercise the installed ES module consumer")
+        self.install()
+        module = self.paths.app / "mods/beads-dashboard/installation.js"
+        result = subprocess.run([self.node, "--input-type=module", "--eval",
+                                 "import {readFileSync} from 'node:fs'; "
+                                 "const code=readFileSync(process.argv[1]).toString('base64'); "
+                                 "const {default: config}=await import('data:text/javascript;base64,'+code); "
+                                 "console.log(JSON.stringify(config));", str(module)],
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(result.stdout), {
+            "lifecycleBridge": str(self.paths.root / "bin/beads_ui.py"),
+            "lifecyclePython": str(self.paths.python), "lifecycleConfig": str(self.paths.config)})
+
+    def test_unknown_legacy_copy_refuses_before_service_or_ui_changes(self):
+        self.paths.bin_home.mkdir()
+        for name in installer.LEGACY_HASHES:
+            with self.subTest(name=name):
+                path = self.paths.bin_home / name
+                path.write_text("unrelated personal tool\n")
+                with self.assertRaisesRegex(installer.InstallError, "unrelated legacy executable"):
+                    self.install(no_start=False)
+                self.assertEqual(path.read_text(), "unrelated personal tool\n")
+                self.assertEqual(self.launch_calls(), [])
+                self.assertFalse(self.paths.config.exists())
+                self.assertFalse(self.paths.app.exists())
+                path.unlink()
+
+    def test_symlink_and_foreign_legacy_copies_are_retained(self):
+        path, data = self.legacy_copy()
+        target = self.base / "foreign executable target"
+        path.rename(target)
+        path.symlink_to(target)
+        with self.assertRaisesRegex(installer.InstallError, "symlink"):
+            self.install(no_start=False)
+        self.assertTrue(path.is_symlink())
+        self.assertEqual(target.read_bytes(), data)
+        path.unlink()
+        path.write_bytes(data)
+        account = installer.pwd.getpwuid(os.getuid())
+        with patch.object(installer.os, "getuid", return_value=os.getuid() + 1), patch.object(installer.pwd, "getpwuid", return_value=account):
+            with self.assertRaisesRegex(installer.InstallError, "foreign-owned"):
+                self.install(no_start=False)
+        self.assertEqual(path.read_bytes(), data)
+        self.assertEqual(self.launch_calls(), [])
+
+    def test_owned_legacy_retirement_has_durable_bytes_and_preserves_history_layouts(self):
+        identity = self.identity_file(legacy=True)
+        history = identity.parent / "historical receipt.json"
+        history.write_text("unchanged history")
+        copies = dict([self.legacy_copy(), self.legacy_copy("go-bd-session.mjs"),
+                       self.legacy_copy("beads_epics.py"), self.legacy_copy("beads_presentation.py"),
+                       self.legacy_copy("go-bd-session.mjs", packaged=True)])
+        layouts = self.paths.app / "layouts"
+        layouts.mkdir(parents=True)
+        for name in ("beads-workspace.json", "beads-workspace.svg"):
+            (layouts / name).write_text("personal layout")
+        self.install()
+        journal = json.loads(self.paths.journal.read_text())
+        retired = {Path(record["path"]): record for record in journal["retired"]}
+        self.assertEqual(set(retired), set(copies))
+        for path, data in copies.items():
+            self.assertFalse(path.exists())
+            self.assertEqual(Path(retired[path]["backup"]).read_bytes(), data)
+            self.assertEqual(retired[path]["sha256"], hashlib.sha256(data).hexdigest())
+        self.assertEqual(history.read_text(), "unchanged history")
+        self.assertEqual(identity.read_bytes(), (self.paths.state / "machine-id").read_bytes())
+        for name in ("beads-workspace.json", "beads-workspace.svg"):
+            self.assertEqual((layouts / name).read_text(), "personal layout")
+        first_receipt = Path(journal["receipt"])
+        self.install()
+        next_journal = json.loads(self.paths.journal.read_text())
+        self.assertEqual(next_journal["previousReceipt"], str(first_receipt))
+        self.assertTrue(first_receipt.is_file())
+        self.assertEqual(self.launch_calls(), [])
+
+    def test_live_controller_blocks_no_start_without_replacing_consumed_files(self):
+        self.install()
+        service = self.paths.root / "bin/beads_service.py"
+        original = service.read_bytes()
+        (self.source / "bin/beads_service.py").write_text("replacement service")
+        config = self.paths.config.read_bytes()
+        with (self.paths.state / "controller.sock.lock").open("r+") as owner:
+            fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(installer.InstallError, "Live controller"):
+                self.install()
+        self.assertEqual(service.read_bytes(), original)
+        self.assertEqual(self.paths.config.read_bytes(), config)
+        self.assertEqual(self.launch_calls(), [])
+
+    def test_live_legacy_launcher_blocks_cutover_and_retains_executable(self):
+        self.identity_file(legacy=True)
+        path, data = self.legacy_copy()
+        lock = self.paths.state_home / "go-bd/project/issue-task.lock"
+        lock.parent.mkdir()
+        installer.private_write(lock, b"")
+        lock.chmod(0o644)
+        with lock.open("r+") as owner:
+            fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(installer.InstallError, "Live legacy launch"):
+                self.install(no_start=False)
+        self.assertEqual(path.read_bytes(), data)
+        self.assertEqual(self.launch_calls(), [])
+        self.assertFalse(self.paths.app.exists())
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o644)
+        self.install()
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o644)
+
+    def test_group_writable_legacy_lock_is_refused_without_chmod(self):
+        self.identity_file(legacy=True)
+        lock = self.paths.state_home / "go-bd/project/issue-task.lock"
+        lock.parent.mkdir()
+        installer.private_write(lock, b"")
+        lock.chmod(0o664)
+        with self.assertRaisesRegex(installer.InstallError, "Unsafe legacy launch"):
+            self.install(no_start=False)
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o664)
+        self.assertEqual(self.launch_calls(), [])
+
+    def test_unconfirmed_startup_retains_extension_and_acknowledged_startup_survives(self):
+        self.identity_file(legacy=True)
+        extension, data = self.legacy_copy("go-bd-session.mjs")
+        config_path = self.paths.state_home / "go-bd/project/launch-startup.json"
+        config_path.parent.mkdir()
+        ack = config_path.with_name("launch-startup-ack.json")
+        session = {"session_id": "saved-session", "session_file": str(self.base / "retained transcript.jsonl"),
+                   "machine": "machine-id", "worktree": str(self.base / "retained worktree")}
+        config = {"ack": str(ack), "machine": session["machine"], "worktree": session["worktree"], "previous": None}
+        installer.private_write(config_path, json.dumps(config).encode())
+        for acknowledgement in (None, {"error": "not loaded"}, {"session": {**session, "machine": "another"}}):
+            if acknowledgement is not None:
+                installer.private_write(ack, json.dumps(acknowledgement).encode())
+            with self.assertRaisesRegex(installer.InstallError, "Unconfirmed legacy startup"):
+                self.install(no_start=False)
+            self.assertEqual(extension.read_bytes(), data)
+            self.assertEqual(self.launch_calls(), [])
+        installer.private_write(ack, json.dumps({"session": session}).encode())
+        original_config = config_path.read_bytes()
+        original_ack = ack.read_bytes()
+        self.install()
+        self.assertFalse(extension.exists())
+        self.assertEqual(config_path.read_bytes(), original_config)
+        self.assertEqual(ack.read_bytes(), original_ack)
+
+    def test_failed_historical_startup_is_retained_but_only_live_creation_blocks_retirement(self):
+        self.identity_file(legacy=True)
+        extension, data = self.legacy_copy("go-bd-session.mjs")
+        config = self.paths.state_home / "go-bd/project/launch-ended.json"
+        config.parent.mkdir()
+        ack = config.with_name("launch-ended-ack.json")
+        installer.private_write(config, json.dumps({"ack": str(ack)}).encode())
+        installer.private_write(ack, b'{"error":"historical workspace missing"}\n')
+        before = {path: path.read_bytes() for path in (config, ack)}
+        hc = self.tools / "hc"
+        hc.write_text("#!/bin/sh\nexit 0\n")
+        hc.chmod(0o700)
+        live = True
+
+        def observed(argv, **kwargs):
+            if Path(argv[0]).name != "hc":
+                return self.fake_run(argv, **kwargs)
+            if argv[1] == "ls":
+                value = {"terminals": [{"address": "t1", "state": "live" if live else "finished"}]}
+            else:
+                value = {"state": "live", "argv": ["env", f"GO_BD_SESSION_CONFIG={config}", "omp"]}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(value), "")
+
+        with patch.object(installer, "run", side_effect=observed):
+            with self.assertRaisesRegex(installer.InstallError, "Unconfirmed legacy startup"):
+                self.install()
+            self.assertEqual(extension.read_bytes(), data)
+            live = False
+            self.install()
+        self.assertFalse(extension.exists())
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_old_controller_startup_requires_exact_fence_ack_before_module_retirement(self):
+        self.install()
+        extension, data = self.legacy_copy("go-bd-session.mjs", packaged=True)
+        config_path = self.paths.state / "omp/retained-run/1.json"
+        config_path.parent.mkdir(parents=True)
+        ack = config_path.with_suffix(".ack.json")
+        session = {"session_id": "exact", "session_file": str(self.base / "transcript.jsonl"),
+                   "machine": "this-machine", "worktree": str(self.base / "workspace")}
+        fence = {"runId": "retained-run", "generation": 1}
+        config = {"ack": str(ack), "machine": session["machine"], "worktree": session["worktree"],
+                  "previous": None, "fence": fence, "bindingId": "exact-binding"}
+        installer.private_write(config_path, json.dumps(config).encode())
+        installer.private_write(ack, json.dumps({"session": session, "observation": {
+            "fence": fence, "bindingId": "another-binding"}}).encode())
+        with self.assertRaisesRegex(installer.InstallError, "another controller binding"):
+            self.install()
+        self.assertEqual(extension.read_bytes(), data)
+        installer.private_write(ack, json.dumps({"session": session, "observation": {
+            "fence": fence, "bindingId": "exact-binding"}}).encode())
+        self.install()
+        self.assertFalse(extension.exists())
+        self.assertTrue(config_path.is_file())
+        self.assertTrue(ack.is_file())
+
+    def test_second_installer_cannot_replace_consumer_files(self):
+        self.install()
+        original = self.paths.config.read_bytes()
+        with (self.paths.state / "install.lock").open("r+") as owner:
+            fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(installer.InstallError, "Live installation"):
+                self.install()
+        self.assertEqual(self.paths.config.read_bytes(), original)
+        self.assertEqual(self.launch_calls(), [])
+
+    def test_service_replacement_follows_stop_and_ui_switch_follows_health(self):
+        self.install()
+        mod = self.paths.app / "mods/beads-dashboard/main.js"
+        original_mod = mod.read_bytes()
+        (self.source / "mods/beads-dashboard/main.js").write_text("// new controller UI")
+        (self.source / "bin/beads_service.py").write_text("# new service")
+        self.calls.clear()
+        publish = installer.publish_files
+        order = []
+
+        def observe_publish(files):
+            if self.paths.root / "bin/beads_service.py" in files:
+                self.assertEqual([argv[1] for argv in self.launch_calls()], ["bootout"])
+                order.append("package")
+            else:
+                self.assertEqual(order, ["package", "healthy"])
+                order.append("ui")
+            return publish(files)
+
+        def healthy(paths, environment):
+            self.assertEqual(mod.read_bytes(), original_mod)
+            self.assertEqual((paths.root / "bin/beads_service.py").read_text(), "# new service")
+            order.append("healthy")
+            return '{"state":"running"}'
+
+        with patch.object(installer, "publish_files", side_effect=observe_publish), patch.object(installer, "runtime_status", side_effect=healthy):
+            self.install(no_start=False)
+        self.assertEqual(order, ["package", "healthy", "ui"])
+        self.assertEqual(mod.read_text(), "// new controller UI")
+        self.assertEqual(json.loads(self.paths.journal.read_text())["phase"], "active")
+
+    def test_failed_provisioning_preserves_ui_and_forward_recovery_receipt(self):
+        self.install()
+        mod = self.paths.app / "mods/beads-dashboard/main.js"
+        original = mod.read_bytes()
+        (self.source / "mods/beads-dashboard/main.js").write_text("// upgraded UI")
+        with patch.object(installer, "provision_python", side_effect=installer.InstallError("dependency unavailable")):
+            with self.assertRaisesRegex(installer.InstallError, "dependency unavailable"):
+                self.install(no_start=False)
+        self.assertEqual(mod.read_bytes(), original)
+        journal = json.loads(self.paths.journal.read_text())
+        self.assertEqual(journal["phase"], "failed-service-stopped")
+        with self.assertRaisesRegex(installer.InstallError, "Incomplete cutover"):
+            installer.manage("restart", self.paths)
+        self.install()
+        self.assertEqual(mod.read_text(), "// upgraded UI")
+        self.assertEqual(json.loads(self.paths.journal.read_text())["previousReceipt"], journal["receipt"])
+
+    def test_ui_publication_failure_rolls_back_existing_mods(self):
+        self.install()
+        old = {self.paths.app / "mods" / mod / "main.js":
+               (self.paths.app / "mods" / mod / "main.js").read_bytes() for mod in installer.MODS}
+        for mod in installer.MODS:
+            (self.source / "mods" / mod / "main.js").write_text("// new controller UI")
+        publish = installer.publish_files
+
+        def partial_publish(files):
+            if next(iter(files)).is_relative_to(self.paths.app):
+                target = next(iter(old))
+                installer.private_write(target, b"partial upgrade")
+                raise OSError("interrupted UI publication")
+            return publish(files)
+
+        with patch.object(installer, "publish_files", side_effect=partial_publish):
+            with self.assertRaisesRegex(OSError, "interrupted UI publication"):
+                self.install()
+        self.assertEqual({path: path.read_bytes() for path in old}, old)
+        self.assertEqual(json.loads(self.paths.journal.read_text())["phase"], "failed-ui-not-activated")
 
 
 class PythonProvisionTests(unittest.TestCase):

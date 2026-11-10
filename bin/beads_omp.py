@@ -64,7 +64,7 @@ class OmpExecution:
         self.hosting = hosting if hosting is not None else HerdrHosting(executables=executables)
         self.state = Path(state if state is not None else
                           Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'herdr-beads/omp').resolve()
-        self.extension = Path(__file__).resolve().with_name('go-bd-session.mjs')
+        self.extension = Path(__file__).resolve().with_name('beads_omp_session.mjs')
         if socket_path is None:
             from beads_transport import default_socket_path
             socket_path = default_socket_path()
@@ -85,7 +85,9 @@ class OmpExecution:
 
     def record(self, run, *, required=False):
         issue = self.authority.issue(run['scope'])
-        metadata = issue.get('metadata') or {}
+        metadata = issue.get('metadata')
+        if metadata is None:
+            metadata = {}
         if not isinstance(metadata, dict):
             raise Refusal('invalid_record', 'Bead metadata must be an object; retained intact.')
         if 'omp_session' not in metadata:
@@ -194,6 +196,7 @@ class OmpExecution:
                   'schemaVersion': 1, 'scope': run['scope'], 'fence': run['fence'],
                   'bindingId': private['bindingId'], 'credential': private['credential'],
                   'controllerSocket': self.socket_path, 'terminal': None,
+                  'sessionConfigEnv': 'BEADS_OMP_SESSION_CONFIG',
                   'access': run['execution']['access']}
         if not previous:
             issue = self.authority.issue(run['scope'])
@@ -305,9 +308,18 @@ class OmpExecution:
             argv += ['--resume', config['previous']['session_file']]
         # No startup prompt on argv: extension delivers it only after durability.
         self.hosting.start(run, ['env', f'BEADS_DIR={run["scope"]["beadsDir"]}',
-                                 f'GO_BD_SESSION_CONFIG={self.path(run)}', *argv],
+                                 f'BEADS_OMP_SESSION_CONFIG={self.path(run)}', *argv],
                            issue=self.authority.issue(run['scope']))
         return self.recover(step, run, intent, private)
+
+    @staticmethod
+    def journal_config_env(config):
+        """Read immutable pre-cutover terminal identity only from its durable journal."""
+        if 'sessionConfigEnv' not in config:
+            return 'GO_BD_SESSION_CONFIG'
+        if config['sessionConfigEnv'] != 'BEADS_OMP_SESSION_CONFIG':
+            raise Refusal('session_mismatch', 'Retained startup configuration has an unknown environment identity.')
+        return config['sessionConfigEnv']
 
     def recover(self, step, run, intent, private):
         if step in ('release', 'read_only'):
@@ -317,12 +329,14 @@ class OmpExecution:
         if step not in ('launch', 'resume'):
             raise Refusal('unsupported_capability', f'No omp recovery protocol for {step}.')
         config = read_json(self.path(run))
-        if config is None:
+        if config is None and not self.path(run).exists():
             return None
+        if not isinstance(config, dict):
+            raise Refusal('invalid_record', 'Retained startup journal must contain a configuration object.')
         if (config.get('operationId') != intent['operationId'] or config.get('fence') != run['fence']
                 or config.get('bindingId') != private['bindingId']):
             raise Refusal('session_mismatch', 'Retained startup intent belongs to another operation/incarnation.')
-        info = self.hosting.find_operation(run, self.path(run))
+        info = self.hosting.find_operation(run, self.path(run), config_env=self.journal_config_env(config))
         if info is None:
             return None
         self.hosting.associate(run, info['address'])
@@ -362,7 +376,8 @@ class OmpExecution:
             raise Refusal('session_mismatch', 'No exact durable startup configuration for this binding.')
         if not terminal or terminal['machineId'] != run['scope']['machineId']:
             raise Refusal('terminal_mismatch', 'Session acknowledgement needs the exact local terminal.')
-        info = self.hosting.find_operation(run, self.path(run), address=terminal['address'])
+        info = self.hosting.find_operation(run, self.path(run), address=terminal['address'],
+                                           config_env=self.journal_config_env(config))
         if not info or info['address'] != terminal['address']:
             raise Refusal('terminal_mismatch', 'Terminal does not carry this operation startup identity.')
         self.hosting.validate(run, info)

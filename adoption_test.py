@@ -43,7 +43,7 @@ class AdoptionHosting(HerdrHosting):
     def start(self, run, argv, *, issue):
         self.starts.append(argv)
 
-    def find_operation(self, run, path, *, address=None):
+    def find_operation(self, run, path, *, address=None, config_env='BEADS_OMP_SESSION_CONFIG'):
         return None
 
 
@@ -146,6 +146,8 @@ class LegacyAdoptionTests(unittest.TestCase):
 
     def test_acknowledged_live_session_adopts_and_focuses_without_relaunch(self):
         self.active()
+        original_terminal = copy.deepcopy(self.hosting.terminals['t1'])
+        original_history = self.transcript.read_bytes()
         result = self.adopt()
         self.assertEqual(result['activity'], 'active')
         self.bind(result)
@@ -153,6 +155,37 @@ class LegacyAdoptionTests(unittest.TestCase):
         self.assertEqual(self.adapter.perform('focus', self.run, self.intent, self.private), {'focused': True})
         self.assertEqual(self.hosting.focused, ['t1'])
         self.assertEqual(self.hosting.starts, [])
+        self.assertEqual(self.hosting.terminals['t1'], original_terminal)
+        self.assertEqual(self.transcript.read_bytes(), original_history)
+        self.assertEqual(self.lease, 'held')
+
+    def test_stopped_legacy_terminal_resumes_exact_transcript_in_new_terminal(self):
+        self.active()
+        self.hosting.terminals['t1']['state'] = 'exited'
+        self.lease = 'free'
+        result = self.adopt()
+        self.assertEqual(result['activity'], 'inactive')
+        self.bind(result)
+        self.assertEqual(self.adapter.inspect(self.run, self.private), 'inactive')
+        original_terminal = copy.deepcopy(self.hosting.terminals['t1'])
+        original_history = self.transcript.read_bytes()
+        original_files = {path: path.read_bytes() for path in self.directory.iterdir()}
+        self.run['fence']['generation'] += 1
+        self.private['bindingId'] = 'resumed-binding'
+        self.intent = {'operationId': str(uuid.uuid4()), 'steps': ['resume'], 'index': 0}
+        self.assertIsNone(self.adapter.perform('resume', self.run, self.intent, self.private))
+        self.assertEqual(len(self.hosting.starts), 1)
+        argv = self.hosting.starts[0]
+        self.assertIn(f'BEADS_OMP_SESSION_CONFIG={self.adapter.path(self.run)}', argv)
+        self.assertEqual(argv[argv.index('--extension') + 1], str(self.adapter.extension))
+        self.assertEqual(argv[-2:], ['--resume', str(self.transcript)])
+        config = json.loads(self.adapter.path(self.run).read_text())
+        self.assertEqual(config['previous'], self.record)
+        self.assertNotIn('prompt_file', config)
+        self.assertEqual(self.hosting.terminals['t1'], original_terminal)
+        self.assertEqual(self.transcript.read_bytes(), original_history)
+        self.assertEqual({path: path.read_bytes() for path in original_files}, original_files)
+        self.assertEqual(self.authority.row['metadata']['unrelated'], {'keep': True})
 
     def test_foreign_machine_is_not_adopted(self):
         self.record['machine'] = 'foreign'

@@ -10,7 +10,6 @@ from pathlib import Path
 import runpy
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 
@@ -173,53 +172,6 @@ class EpicReconciliationTests(unittest.TestCase):
         result = observe_epics(ReadFailure())
         self.assertEqual(result["errors"][0]["id"], held)
         self.assertEqual(self.row(result, free)["status"], "open")
-
-    def test_installed_launcher_epic_refresh_never_closes(self):
-        epic = self.create("ui-parent", "epic")
-        child = self.create("ui-child", parent=epic)
-        self.close(child)
-        before = self.project.show(epic)
-        launcher = str(Path(__file__).parent.resolve() / "bin/go-bd")
-        result = subprocess.run([sys.executable, launcher, "--reconcile-epics", "--json"],
-                                cwd=self.project.root, env=self.project.env, text=True,
-                                capture_output=True, timeout=60)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(self.row(json.loads(result.stdout), epic)["eligible"])
-        self.assertEqual(self.project.show(epic), before)
-
-    def test_launcher_cli_rejects_epics_without_receipts_or_workspaces(self):
-        epic = self.create("sessionless", "epic", metadata='{"preserved":{"answer":42}}')
-        before = self.project.show(epic)
-        traps = self.project.root / "command-traps"
-        traps.mkdir()
-        tripwire = self.project.root / "unexpected-launch"
-        # Required binaries exist for preflight but must never execute. This
-        # prevents the regression itself from starting a real omp/Herdr session.
-        for name in ("omp", "herdr-app", "hc"):
-            executable = traps / name
-            executable.write_text(
-                '#!/bin/sh\nprintf "%s\\n" invoked > "$HOME/../unexpected-launch"\nexit 99\n'
-            )
-            executable.chmod(0o700)
-        env = dict(self.project.env)
-        env["PATH"] = str(traps) + os.pathsep + env["PATH"]
-        launcher = str(Path(__file__).parent.resolve() / "bin/go-bd")
-        for args in (("--herdr", epic, "--json"), (epic,)):
-            with self.subTest(args=args):
-                command = subprocess.run(
-                    [sys.executable, launcher, *args], cwd=self.project.root, env=env,
-                    text=True, capture_output=True, timeout=60,
-                )
-                self.assertNotEqual(command.returncode, 0)
-                self.assertIn("sessionless", command.stderr.lower())
-                self.assertEqual(self.project.show(epic), before)
-                self.assertFalse(tripwire.exists())
-                state = Path(env["XDG_STATE_HOME"]) / "go-bd"
-                self.assertEqual(list(state.rglob("*.json")), [])
-                self.assertEqual(list(state.rglob("launch-*")), [])
-                self.assertFalse((Path(env["HOME"]) / ".omp").exists())
-                self.assertFalse((self.project.root / ".git/worktrees").exists())
-
 
 
 if __name__ == "__main__":
