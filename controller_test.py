@@ -204,6 +204,37 @@ class LifecycleTests(unittest.TestCase):
         self.drain()
         return self.status()['run']
 
+    def assert_manual_handoff(self, run):
+        closure = run['closure']
+        self.assertEqual(closure['state'], 'awaiting_manual')
+        self.assertEqual(closure['reason'], 'Merged — awaiting manual closure')
+        self.assertIsInstance(closure['manualCommand'], str)
+        handoff = closure['handoff']
+        self.assertEqual(set(handoff), {'handoffId', 'createdAt', 'scope', 'fence', 'owner',
+            'coverageRevision', 'workspaceHead', 'target', 'submissions', 'evidenceReason', 'warning', 'review'})
+        self.assertRegex(handoff['handoffId'], r'^[0-9a-f]{64}$')
+        for name in ('scope', 'fence', 'owner', 'target'):
+            self.assertEqual(handoff[name], run[name])
+        self.assertEqual(handoff['coverageRevision'], run['coverage']['revision'])
+        self.assertEqual(handoff['workspaceHead'], run['coverage']['workspaceHead'])
+        required = run['coverage']['required']
+        submissions = [s for s in run['submissions'] if {
+            name: s['identity'][name] for name in ('submissionId', 'submissionRevision')} in required]
+        self.assertCountEqual(handoff['submissions'], submissions)
+        self.assertTrue(all(s['state'] == 'integrated' and s['evidence'] for s in handoff['submissions']))
+        return copy.deepcopy(handoff)
+
+    def assert_handoff_revoked(self, run, historical=None):
+        self.assertIsNone(run['closure']['manualCommand'])
+        self.assertIsNone(run['closure']['handoff'])
+        if historical is not None:
+            self.assertTrue(any(entry.get('closure', {}).get('handoff') == historical
+                for entry in self.store.read(self.scope)['audit']))
+        self.assertEqual(self.authority.row['metadata'], {'unrelated': {'keep': True}})
+        self.assertTrue(self.workspace.path.exists())
+        self.assertIn('worktree ' + str(self.workspace.path), git(self.repo, 'worktree', 'list', '--porcelain'))
+        self.assertEqual(git(self.workspace.path, 'symbolic-ref', 'HEAD'), run['workspace']['branchRef'])
+
     def test_concurrent_starts_reserve_exactly_one_active_attempt(self):
         barrier = threading.Barrier(3)
         results = []
@@ -283,9 +314,15 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(run['coverage']['state'], 'integrated')
         self.assertEqual(run['closure']['reason'], 'Merged — awaiting manual closure')
         self.assertEqual(run['closure']['state'], 'awaiting_manual')
+        snapshot = self.assert_manual_handoff(run)
+        command = run['closure']['manualCommand']
         self.assertEqual(self.authority.row['status'], 'in_progress')
         self.assertEqual(self.authority.row['metadata'], {'unrelated': {'keep': True}})
         self.controller = self.restart()
+        self.assertEqual(self.status()['run']['closure']['handoff'], snapshot)
+        repeated = self.reconcile()
+        self.assertEqual(repeated['closure']['handoff'], snapshot)
+        self.assertEqual(repeated['closure']['manualCommand'], command)
         self.assertEqual(self.status()['run']['submissions'][0]['identity']['head'], identity['head'])
         self.assertEqual(self.status()['run']['cleanup']['blockers'], ['manual_cleanup_required'])
         self.assertTrue(self.workspace.path.exists())
@@ -294,16 +331,18 @@ class LifecycleTests(unittest.TestCase):
         self.start()
         identity = self.handoff()
         git(self.repo, 'merge', '--ff-only', identity['head'])
-        self.reconcile()
+        snapshot = self.assert_manual_handoff(self.reconcile())
         self.authority.row['status'] = 'closed'
         closed = self.reconcile()
         self.assertEqual(closed['closure']['state'], 'observed_closed')
         self.assertIsNone(closed['closure']['manualCommand'])
+        self.assert_handoff_revoked(closed, snapshot)
         self.authority.row['status'] = 'open'
         reopened = self.reconcile()
         self.assertEqual(reopened['disposition'], 'reopened')
         self.assertNotEqual(reopened['coverage']['state'], 'integrated')
         self.assertIsNone(reopened['closure']['manualCommand'])
+        self.assert_handoff_revoked(reopened, snapshot)
         self.assertEqual(self.authority.row['status'], 'open')
         self.assertTrue(self.workspace.path.exists())
 
@@ -314,11 +353,46 @@ class LifecycleTests(unittest.TestCase):
         git(self.repo, 'merge', '--ff-only', identity['head'])
         integrated = self.reconcile()
         evidence = integrated['submissions'][0]['evidence']
+        snapshot = self.assert_manual_handoff(integrated)
         git(self.repo, 'reset', '--hard', old_target)
         held = self.reconcile()
         self.assertNotEqual(held['coverage']['state'], 'integrated')
         self.assertIsNone(held['closure']['manualCommand'])
+        self.assert_handoff_revoked(held, snapshot)
         self.assertTrue(any(entry.get('submissions', [{}])[0].get('evidence') == evidence for entry in self.store.read(self.scope)['audit'] if entry.get('submissions')))
+
+    def test_workspace_commit_during_provider_observation_cannot_complete_old_submission(self):
+        self.start()
+        identity = self.handoff()
+        git(self.repo, 'merge', '--ff-only', identity['head'])
+        original = self.controller.integration.observe
+        def observe(run, receipts):
+            result = original(run, receipts)
+            (self.workspace.path / 'new-work').write_text('not submitted')
+            git(self.workspace.path, 'add', '.')
+            git(self.workspace.path, 'commit', '-m', 'unsubmitted during observation')
+            return result
+        self.controller.integration.observe = observe
+        run = self.reconcile()
+        self.assertNotEqual(run['coverage']['state'], 'integrated')
+        self.assertIsNone(run['closure']['manualCommand'])
+        self.assert_handoff_revoked(run)
+
+    def test_issue_reassigned_during_observation_revokes_manual_handoff(self):
+        self.start()
+        identity = self.handoff()
+        git(self.repo, 'merge', '--ff-only', identity['head'])
+        snapshot = self.assert_manual_handoff(self.reconcile())
+        original = self.controller.integration.observe
+        def observe(run, receipts):
+            result = original(run, receipts)
+            self.authority.row['assignee'] = 'new-owner'
+            return result
+        self.controller.integration.observe = observe
+        run = self.reconcile()
+        self.assertEqual(run['disposition'], 'reassigned')
+        self.assertIsNone(run['closure']['manualCommand'])
+        self.assert_handoff_revoked(run, snapshot)
 
     def test_pr_record_survives_restart_without_local_provider_requirements(self):
         self.start()
@@ -329,6 +403,70 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(run['target'], target)
         self.assertEqual(run['submissions'][0]['identity'], identity)
         self.assertNotIn('pullRequest', run['target'])
+
+    def test_provider_nonmerge_stale_head_and_unavailable_proof_revoke_handoff(self):
+        self.start()
+        target = {'mode': 'github-pr', 'repository': {'host': 'github.com', 'repositoryId': '123',
+                  'owner': 'owner', 'name': 'repo'}, 'ref': 'refs/heads/master'}
+        identity = self.handoff(target)
+        observation = {'state': 'integrated'}
+        def provider(target, submitted, cwd):
+            state = observation['state']
+            if state == 'unavailable':
+                raise Refusal('evidence_unavailable', 'Provider proof is unavailable.', True)
+            if state != 'integrated':
+                return state, None
+            return state, {'targetCommit': identity['head'], 'pullRequest': identity['pullRequest'],
+                'mergedAt': '2026-01-01T00:00:00Z', 'mergedHead': identity['head'],
+                'mergeCommit': identity['head'], 'providerRecordId': 'PR_exact_record'}
+        self.controller.integration.pull_request = provider
+        for state in ('closed_unmerged', 'head_changed', 'unavailable'):
+            with self.subTest(provider_state=state):
+                observation['state'] = 'integrated'
+                integrated = self.reconcile()
+                snapshot = self.assert_manual_handoff(integrated)
+                self.assertEqual(snapshot['submissions'][0]['evidence']['kind'], 'github-pr')
+                observation['state'] = state
+                invalidated = self.reconcile()
+                self.assertNotEqual(invalidated['coverage']['state'], 'integrated')
+                self.assert_handoff_revoked(invalidated, snapshot)
+                if state == 'unavailable':
+                    self.assertEqual(self.status()['operation']['error']['code'], 'evidence_unavailable')
+                else:
+                    self.assertEqual(invalidated['submissions'][0]['state'], state)
+                self.assertEqual(self.authority.row['status'], 'in_progress')
+
+    def test_handoff_snapshots_only_exact_required_revisions_and_rejects_late_submission(self):
+        self.start()
+        obsolete = self.handoff()
+        current = self.handoff(revision=2)
+        run = self.status()['run']
+        base = {'submissionId': 'base', 'submissionRevision': 1,
+                'head': git(self.repo, 'rev-parse', 'master'), 'target': self.target, 'pullRequest': None}
+        result = self.call('handoff', {'expected': self.condition(),
+            'previousCoverageRevision': run['coverage']['revision'], 'target': self.target,
+            'workspaceHead': current['head'], 'requiredSubmissions': [base, current],
+            'summary': 'exact complete set', 'nextSteps': [], 'risks': []})
+        self.assertEqual(result['outcome'], 'ok', result)
+        self.assert_handoff_revoked(self.status()['run'])
+        git(self.repo, 'merge', '--ff-only', current['head'])
+        integrated = self.reconcile()
+        snapshot = self.assert_manual_handoff(integrated)
+        self.assertCountEqual([s['identity'] for s in snapshot['submissions']], [current, base])
+        self.assertNotIn(obsolete, [s['identity'] for s in snapshot['submissions']])
+        command = integrated['closure']['manualCommand']
+        replacement = copy.deepcopy(current)
+        replacement['submissionRevision'] += 1
+        refused = self.call('handoff', {'expected': self.condition(),
+            'previousCoverageRevision': integrated['coverage']['revision'], 'target': self.target,
+            'workspaceHead': current['head'], 'requiredSubmissions': [replacement],
+            'summary': 'late replacement', 'nextSteps': [], 'risks': []})
+        self.assertEqual(refused['error']['code'], 'run_read_only')
+        self.assertEqual(self.status()['run']['closure']['handoff'], snapshot)
+        self.assertEqual(self.status()['run']['closure']['manualCommand'], command)
+        self.assertEqual(self.authority.row['status'], 'in_progress')
+        self.assertEqual(self.authority.row['metadata'], {'unrelated': {'keep': True}})
+        self.assertTrue(self.workspace.path.exists())
 
     def test_release_retains_resources_and_rejects_resume(self):
         self.start()
@@ -701,6 +839,7 @@ class LifecycleTests(unittest.TestCase):
         identity = self.handoff()
         git(self.repo, 'merge', '--ff-only', identity['head'])
         integrated = self.reconcile()
+        snapshot = self.assert_manual_handoff(integrated)
         invalid = copy.deepcopy(integrated['submissions'][0])
         invalid['evidence']['head'] = 'a' * 40
         class CorruptObserver:
@@ -710,6 +849,7 @@ class LifecycleTests(unittest.TestCase):
         result = self.reconcile()
         self.assertNotEqual(result['coverage']['state'], 'integrated')
         self.assertIsNone(result['closure']['manualCommand'])
+        self.assert_handoff_revoked(result, snapshot)
         self.assertEqual(self.status()['operation']['error']['code'], 'evidence_invalid')
         self.assertEqual(self.authority.row['status'], 'in_progress')
 
@@ -795,6 +935,9 @@ class LifecycleTests(unittest.TestCase):
 
     def test_new_attempt_isolated_and_old_callback_cannot_mutate_it(self):
         self.start()
+        identity = self.handoff()
+        git(self.repo, 'merge', '--ff-only', identity['head'])
+        snapshot = self.assert_manual_handoff(self.reconcile())
         old = self.status()['run']
         private = copy.deepcopy(self.store.read(self.scope)['private'][old['fence']['runId']])
         self.call('release', {'expected': self.condition(), 'reason': 'new work'})
@@ -818,6 +961,7 @@ class LifecycleTests(unittest.TestCase):
         current = self.status()['run']
         self.assertEqual(current['fence']['attempt'], old['fence']['attempt'] + 1)
         self.assertEqual(current['submissions'], [])
+        self.assert_handoff_revoked(current, snapshot)
         self.assertTrue(old_workspace.exists())
         observation = {'fence': old['fence'], 'bindingId': private['bindingId'], 'eventId': 'late',
             'sequence': private['sequence'] + 1, 'observedAt': now(),
@@ -891,20 +1035,36 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.authority.row['status'], 'in_progress')
 
 
-    def test_manual_command_quotes_issue_and_pins_canonical_database_and_checkout(self):
+    def test_manual_command_quotes_hostile_identity_database_checkout_and_owner(self):
+        hostile_repo = self.home / "checkout '; $(printf injected); #"
+        git(self.home, 'clone', str(self.repo), str(hostile_repo))
+        self.repo = hostile_repo
+        self.scope['repository'] = repository_identity(str(self.repo))
+        self.scope['beadsDir'] = str(self.repo / ".beads '; $(printf injected); #")
         self.scope['issueId'] = "full-id'; printf injected; #"
+        self.target['repository'] = self.scope['repository']
+        self.workspace.root = self.repo
         self.authority.row['id'] = self.scope['issueId']
+        owner = "owner'; $(printf injected); #"
+        self.authority.owner = lambda scope: owner
+        def claim(step, run, intent, private):
+            self.authority.row.update(status='in_progress', assignee=owner)
+            return self.authority.recover(step, run, intent, private)
+        self.authority.perform = claim
         self.start()
-        identity = self.handoff()
+        identity = self.handoff(submission_id="source'; $(printf injected); #")
         git(self.repo, 'merge', '--ff-only', identity['head'])
         run = self.reconcile()
+        snapshot = self.assert_manual_handoff(run)
+        self.assertEqual(snapshot['owner'], owner)
         argv = shlex.split(run['closure']['manualCommand'])
-        self.assertEqual(argv[0], 'BEADS_DIR=' + self.scope['beadsDir'])
-        self.assertEqual(argv[1], 'bd')
-        self.assertEqual(argv[argv.index('-C') + 1], self.scope['repository']['root'])
-        self.assertEqual(argv[-2:], ['--', self.scope['issueId']])
-        self.assertNotIn('--force', argv)
-        self.assertIn(run['fence']['runId'], argv[argv.index('--reason') + 1])
+        self.assertEqual(argv, ['BEADS_DIR=' + self.scope['beadsDir'], 'bd', '--sandbox',
+            '-C', self.scope['repository']['root'], 'close', '--reason', snapshot['evidenceReason'],
+            '--', self.scope['issueId']])
+        self.assertIn(run['fence']['runId'], snapshot['evidenceReason'])
+        self.assertEqual(self.authority.row['status'], 'in_progress')
+        self.assertEqual(self.authority.row['metadata'], {'unrelated': {'keep': True}})
+        self.assertTrue(self.workspace.path.exists())
 
     def test_remote_authority_is_not_downgraded_to_local_integration(self):
         self.start()
@@ -946,6 +1106,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(changed['coverage']['required'], [{'submissionId': replacement['submissionId'], 'submissionRevision': 2}])
         self.assertEqual(changed['coverage']['state'], 'pending')
         self.assertIsNone(changed['closure']['manualCommand'])
+        self.assert_handoff_revoked(changed)
         self.assertEqual(next(s for s in changed['submissions'] if s['identity']['submissionId'] == base['submissionId'])['evidence'], old['evidence'])
 
 
