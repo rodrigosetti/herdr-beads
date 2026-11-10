@@ -55,7 +55,8 @@ def live_omp(info):
 
 
 class OmpExecution:
-    capabilities = ['launch', 'exact_resume', 'durable_identity', 'owner_activity', 'structured_handoff']
+    capabilities = ['launch', 'exact_resume', 'durable_identity', 'owner_activity',
+                    'structured_handoff', 'explicit_release', 'read_only']
 
     def __init__(self, authority=None, hosting=None, state=None, socket_path=None, executables=None):
         self.executables = dict(executables) if executables is not None else None
@@ -237,7 +238,56 @@ class OmpExecution:
             return None
         return ack
 
+    def control_state(self, step, run):
+        if step == 'read_only' and run['execution']['access'] != 'read_only':
+            raise Refusal('session_mismatch', 'Read-only enforcement requires a controller-fenced session.')
+        if step == 'release' and run['release']['state'] not in ('requested', 'released'):
+            raise Refusal('session_mismatch', 'Release requires an explicit preceding owner request.')
+
+    def control(self, step, run, intent, private):
+        """Publish once; only the exact idle extension can acknowledge the effect."""
+        self.control_state(step, run)
+        _, binding, info = self.binding_context(run, private, run['execution']['terminal'])
+        self.validate_process(run, binding, info, run['execution']['session'])
+        if binding.get('acknowledged') is not True:
+            raise Refusal('session_mismatch', 'Control requires a durably acknowledged primary session.')
+        path = Path(str(self.path(run)) + '.control.json')
+        command = {'command': step, 'requestId': intent['operationId'], 'fence': run['fence'],
+                   'bindingId': private['bindingId'], 'session': binding['binding'],
+                   'pid': binding['pid'], 'sequence': binding['observation']['sequence']}
+        previous = read_json(path)
+        if previous and previous.get('requestId') == intent['operationId']:
+            if any(previous.get(key) != command[key] for key in
+                   ('command', 'fence', 'bindingId', 'session', 'pid')):
+                raise Refusal('session_mismatch', 'Control operation already has a different durable request.')
+        else:
+            durable_json(path, command)
+        return self.recover(step, run, intent, private)
+
+    def recover_control(self, step, run, intent, private):
+        self.control_state(step, run)
+        command = read_json(Path(str(self.path(run)) + '.control.json'))
+        if command is None:
+            return None
+        if (not isinstance(command, dict) or command.get('command') != step
+                or command.get('requestId') != intent['operationId']
+                or command.get('fence') != run['fence'] or command.get('bindingId') != private['bindingId']):
+            raise Refusal('session_mismatch', 'Retained control belongs to another operation/incarnation.')
+        _, binding, info = self.binding_context(run, private, run['execution']['terminal'])
+        self.validate_process(run, binding, info, run['execution']['session'])
+        if (command.get('session') != binding['binding'] or command.get('pid') != binding['pid']
+                or type(command.get('sequence')) is not int):
+            raise Refusal('session_mismatch', 'Retained control names another exact session/process.')
+        observation = binding.get('observation') or {}
+        if ((observation.get('event') or {}).get('kind') != step + '_acknowledged'
+                or observation.get('sequence', 0) <= command['sequence']):
+            return None
+        self.validate_observation(run, observation, private)
+        return {'observation': observation}
+
     def perform(self, step, run, intent, private):
+        if step in ('release', 'read_only'):
+            return self.control(step, run, intent, private)
         if step == 'focus':
             if self.inspect(run, private) != 'active':
                 raise Refusal('session_owned', 'Exact prior process is not active; refresh before resume.')
@@ -246,7 +296,7 @@ class OmpExecution:
             if self.inspect(run, private) != 'active':
                 raise Refusal('session_owned', 'omp exited while focusing; no replacement launched.')
             return {'focused': True}
-        if step not in ('launch', 'resume') or run['execution']['access'] != 'writable':
+        if step not in ('launch', 'resume') or (step == 'launch' and run['execution']['access'] != 'writable'):
             raise Refusal('unsupported_capability', f'Installed omp adapter cannot enforce {step}/{run["execution"]["access"]}.')
         self.preflight(run)
         config = self.config(run, intent, private)
@@ -259,6 +309,8 @@ class OmpExecution:
         return self.recover(step, run, intent, private)
 
     def recover(self, step, run, intent, private):
+        if step in ('release', 'read_only'):
+            return self.recover_control(step, run, intent, private)
         if step == 'focus':
             return {'focused': True} if self.inspect(run, private) == 'active' else None
         if step not in ('launch', 'resume'):
@@ -301,14 +353,12 @@ class OmpExecution:
             raise Refusal('session_mismatch', 'Durable binding belongs to another incarnation/machine/workspace.')
         self.validate_record(run, binding['omp'])
 
-    def validate_observation(self, run, observation, private):
-        event = observation['event']
-        if event['kind'] not in ('session_bound', 'activity', 'exited'):
-            raise Refusal('unsupported_capability', 'Installed omp adapter does not support this lifecycle observation.')
+    def binding_context(self, run, private, terminal):
         config = read_json(self.path(run))
-        if not config or config.get('bindingId') != private['bindingId'] or config.get('fence') != run['fence']:
+        if (not config or config.get('bindingId') != private['bindingId'] or config.get('fence') != run['fence']
+                or config.get('scope') != run['scope'] or config.get('worktree') != run['workspace']['path']
+                or config.get('credential') != private['credential']):
             raise Refusal('session_mismatch', 'No exact durable startup configuration for this binding.')
-        terminal = event.get('terminal') if event['kind'] == 'session_bound' else run['execution']['terminal']
         if not terminal or terminal['machineId'] != run['scope']['machineId']:
             raise Refusal('terminal_mismatch', 'Session acknowledgement needs the exact local terminal.')
         info = self.hosting.find_operation(run, self.path(run), address=terminal['address'])
@@ -318,18 +368,58 @@ class OmpExecution:
         binding = read_json(Path(str(self.path(run)) + '.binding.json'))
         if binding is not None:
             self.validate_binding(run, binding)
-            session = event['session'] if event['kind'] == 'session_bound' else run['execution']['session']
-            if (binding.get('observation') != observation or binding['binding'] != session
-                    or binding['binding']['bindingId'] != private['bindingId']
-                    or binding.get('pid') != (info.get('foreground') or {}).get('pid')
-                    or not live_omp(info) or self.lease(binding['omp']) != 'held'):
-                raise Refusal('session_mismatch', 'Observation is not backed by the exact durable omp binding/process.')
+            if binding['binding']['bindingId'] != private['bindingId']:
+                raise Refusal('session_mismatch', 'Durable omp binding belongs to another controller binding.')
+        return config, binding, info
+
+    def validate_process(self, run, binding, info, session):
+        if (not binding or binding['binding'] != session
+                or type(binding.get('pid')) is not int or binding['pid'] <= 0
+                or binding['pid'] != (info.get('foreground') or {}).get('pid')
+                or not live_omp(info) or self.lease(binding['omp']) != 'held'):
+            raise Refusal('session_mismatch', 'Observation is not backed by the exact durable omp binding/process.')
+
+    def validate_observation(self, run, observation, private):
+        event = observation['event']
+        kind = event['kind']
+        if kind not in ('session_bound', 'activity', 'exited', 'read_only_acknowledged', 'release_acknowledged'):
+            raise Refusal('unsupported_capability', 'Installed omp adapter does not support this lifecycle observation.')
+        if observation['fence'] != run['fence'] or observation['bindingId'] != private['bindingId']:
+            raise Refusal('session_mismatch', 'Observation belongs to another incarnation/binding.')
+        terminal = event.get('terminal') if kind == 'session_bound' else run['execution']['terminal']
+        config, binding, info = self.binding_context(run, private, terminal)
+        if binding is not None:
+            session = event['session'] if kind == 'session_bound' else run['execution']['session']
+            self.validate_process(run, binding, info, session)
+            if binding.get('observation') != observation:
+                raise Refusal('session_mismatch', 'Observation differs from the exact durable extension receipt.')
         else:
-            if event['kind'] != 'session_bound':
-                raise Refusal('session_mismatch', 'Activity requires the exact durable extension observation.')
+            if kind != 'session_bound':
+                raise Refusal('session_mismatch', 'Lifecycle acknowledgement requires the exact durable extension observation.')
             ack = self.ack(run, config, info)
             if not ack or event['session'] != {'harness': 'omp', 'sessionId': ack['session']['session_id'], 'bindingId': private['bindingId']}:
                 raise Refusal('session_mismatch', 'Observation is not backed by the exact durable omp process/receipt.')
+        if kind in ('read_only_acknowledged', 'release_acknowledged'):
+            step = kind.removesuffix('_acknowledged')
+            self.control_state(step, run)
+            command = read_json(Path(str(self.path(run)) + '.control.json'))
+            if (not isinstance(command, dict) or command.get('command') != step
+                    or command.get('fence') != run['fence'] or command.get('bindingId') != private['bindingId']
+                    or command.get('session') != session or command.get('pid') != binding['pid']
+                    or type(command.get('sequence')) is not int or observation['sequence'] <= command['sequence']
+                    or not command.get('requestId') or binding.get('acknowledged') is not True
+                    or binding.get('frozen') is not True or binding.get('access') != 'read_only'):
+                raise Refusal('session_mismatch', 'Control acknowledgement lacks its exact request and frozen owner gate.')
+            if step == 'read_only':
+                if event['session'] != session or binding.get('released') is not False:
+                    raise Refusal('session_mismatch', 'Read-only acknowledgement changed the exact unreleased session.')
+            else:
+                receipt = event['receipt']
+                if (binding.get('released') is not True or receipt['receiptId'] != command['requestId']
+                        or receipt['fence'] != run['fence'] or receipt['session'] != session
+                        or receipt['acknowledgedBy'] != 'omp'
+                        or (run['release']['state'] == 'released' and run['release']['receipt'] != receipt)):
+                    raise Refusal('session_mismatch', 'Release acknowledgement differs from the exact owner request/session.')
 
     def publish_observation(self, run, observation, private):
         if observation['event']['kind'] != 'session_bound':

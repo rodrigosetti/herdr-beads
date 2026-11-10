@@ -885,6 +885,16 @@ class Controller:
         return result
 
     def apply_reconcile(self, run, receipt, doc):
+        if receipt.get('head') is not None:
+            blockers = run['cleanup']['blockers']
+            for blocker, present in (
+                    ('unpushed_or_unpreserved', bool(run['coverage']['workspaceHead'])
+                     and receipt['head'] != run['coverage']['workspaceHead']),
+                    ('dirty', not receipt['clean'])):
+                if blocker in blockers:
+                    blockers.remove(blocker)
+                if present:
+                    blockers.append(blocker)
         observation = receipt.get('workspaceObservation')
         if observation is not None:
             validate('run', observation, 'WorkspaceObservation')
@@ -902,7 +912,7 @@ class Controller:
             run['fence']['generation'] += 1
             run['execution']['access'] = 'read_only'
             run['execution']['readOnlyAcknowledged'] = False
-            run['execution']['activity'] = 'unknown'
+            run['execution']['activity'] = 'inactive' if run['release']['state'] == 'released' else 'unknown'
         required = run['coverage']['required']
         doc['audit'].append({'kind': 'reconcile', 'fence': copy.deepcopy(run['fence']),
                              'coverage': copy.deepcopy(run['coverage']),
@@ -950,7 +960,8 @@ class Controller:
             elif receipt.get('error'):
                 reason = receipt['error']['message']
             elif receipt.get('head') != run['coverage']['workspaceHead'] or not receipt.get('clean'):
-                reason = 'Workspace HEAD or cleanliness changed; review and submit the exact current work.'
+                reason = (f"Workspace HEAD {receipt.get('head')} (submitted {run['coverage']['workspaceHead']}) "
+                          f"or cleanliness changed (clean={receipt.get('clean')}); review and submit the exact current work.")
             else:
                 states = ', '.join(f"{k['submissionId']}@{k['submissionRevision']}: {by_key[canonical_json(k)]['state']}" for k in required)
                 reason = f'Integration proof unavailable ({states}); review the authoritative target/provider or trusted rewritten-history mapping.'
@@ -970,7 +981,8 @@ class Controller:
                                       handoff=handoff, manualCommand=manual_close_command(handoff))
         if issue['status'] == 'closed':
             run['closure'].update(state='observed_closed',
-                reason='Externally closed — observed only; no run closure ownership or integration inferred.')
+                reason='Externally closed — observed only; no run closure ownership or integration inferred.'
+                       + (f' {reason}' if reason and not complete else ''))
         hold_cleanup(run)
 
     @staticmethod

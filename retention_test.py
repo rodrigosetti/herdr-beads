@@ -111,6 +111,60 @@ class RetentionTests(unittest.TestCase):
                     for path, content in receipts.items():
                         self.assertEqual(path.read_bytes(), content)
 
+    def test_closed_extra_work_remains_visible_after_restart(self):
+        fixture, provider, registry = self.fixture()
+        fixture.reconcile()
+        path = fixture.workspace.path
+        (path / 'extra').write_text('post-submission work\n')
+        git(path, 'add', 'extra')
+        git(path, 'commit', '-m', 'retained extra work')
+        extra_head = git(path, 'rev-parse', 'HEAD')
+        (path / 'source').write_text('dirty tracked work\n')
+        (path / 'untracked').write_text('retained untracked work\n')
+        fixture.authority.row['status'] = 'closed'
+        self.server(fixture).reconcile_once()
+        fixture.controller = Controller('machine', Store(fixture.home / 'state'),
+            fixture.authority, fixture.execution, provider)
+        self.server(fixture).reconcile_once()
+        run = fixture.status()['run']
+        self.assertEqual(run['closure']['state'], 'observed_closed')
+        self.assertIsNone(run['closure']['manualCommand'])
+        self.assertEqual(run['coverage']['state'], 'unknown')
+        self.assertIn('unpushed_or_unpreserved', run['cleanup']['blockers'])
+        self.assertIn('dirty', run['cleanup']['blockers'])
+        self.assertEqual(git(path, 'rev-parse', 'HEAD'), extra_head)
+        self.assertEqual((path / 'source').read_text(), 'dirty tracked work\n')
+        self.assertEqual((path / 'untracked').read_text(), 'retained untracked work\n')
+        self.assertEqual(registry[0]['path'], str(path))
+
+    def test_released_run_recovers_reopen_and_reassignment_without_reclosure(self):
+        for change, disposition in (({'status': 'in_progress'}, 'reopened'),
+                                    ({'assignee': 'new-owner'}, 'reassigned')):
+            with self.subTest(disposition=disposition):
+                fixture, provider, registry = self.fixture()
+                fixture.reconcile()
+                fixture.call('release', {'expected': fixture.condition(), 'reason': 'owner release'})
+                fixture.drain()
+                fixture.authority.row['status'] = 'closed'
+                fixture.reconcile()
+                released = copy.deepcopy(fixture.status()['run']['release'])
+                fixture.authority.row.update(change)
+                fixture.controller = Controller('machine', Store(fixture.home / 'state'),
+                    fixture.authority, fixture.execution, provider)
+                server = self.server(fixture)
+                server.reconcile_once()
+                server.reconcile_once()
+                run = fixture.status()['run']
+                self.assertEqual(run['disposition'], disposition)
+                self.assertEqual(run['release'], released)
+                self.assertEqual(run['execution']['state'], 'released')
+                self.assertEqual(run['execution']['activity'], 'inactive')
+                self.assertIsNone(run['closure']['manualCommand'])
+                self.assertEqual(fixture.authority.row['status'], change.get('status', 'closed'))
+                self.assertIn('manual_cleanup_required', run['cleanup']['blockers'])
+                self.assertTrue(Path(run['workspace']['path']).is_dir())
+                self.assertEqual(registry[0]['path'], run['workspace']['path'])
+
     def test_missing_workspace_still_records_external_closure_and_keeps_registration(self):
         fixture, provider, registry = self.fixture()
         fixture.reconcile()
