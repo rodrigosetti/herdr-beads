@@ -96,6 +96,184 @@ class WorkspaceAdapterTests(unittest.TestCase):
         self.run['workspace'] = workspace
         return workspace, private
 
+    def retained_workspace(self, backing):
+        if backing == 'linked':
+            return self.provision()[0]
+        path = self.home / 'retained-clone'
+        git(self.home, 'clone', '--no-hardlinks', str(self.repo), str(path))
+        git(path, 'checkout', '-b', 'test-1')
+        self.registry.append({'path': str(path), 'parentRepo': str(self.repo), 'branch': 'test-1'})
+        workspace = self.provider.adopt(self.run, str(path))
+        self.run['workspace'] = workspace
+        return workspace
+
+    def retention_resources(self, workspace):
+        def files(root):
+            root = Path(root)
+            return {str(path.relative_to(root)): path.read_bytes()
+                    for path in root.rglob('*') if path.is_file()}
+        return {'run': copy.deepcopy(self.run), 'registry': copy.deepcopy(self.registry),
+                'source': files(self.repo), 'workspace': files(workspace['path'])}
+
+    def assert_observation(self, state):
+        observation = self.provider.observe_retention(self.run)
+        validate('run', observation, 'WorkspaceObservation')
+        self.assertEqual(observation['state'], state)
+        return observation
+
+    def test_retention_observes_linked_and_clone_without_mutating_resources(self):
+        for backing in ('linked', 'clone'):
+            with self.subTest(backing=backing):
+                workspace = self.retained_workspace(backing)
+                (Path(workspace['path']) / 'operator-note').write_text('retain this untracked file\n')
+                before = self.retention_resources(workspace)
+                self.calls.clear()
+                for _ in range(2):
+                    self.assert_observation('present')
+                self.assertEqual(self.retention_resources(workspace), before)
+                self.assertFalse(any(argv[0] == 'omp' and argv != ['omp', 'worktree', 'list', '--json']
+                                     for argv in self.calls))
+
+    def test_retention_missing_exact_paths_preserves_registrations_and_resources(self):
+        for backing in ('linked', 'clone'):
+            with self.subTest(backing=backing):
+                workspace = self.retained_workspace(backing)
+                path = Path(workspace['path'])
+                displaced = path.with_name(path.name + '-externally-retained')
+                before = self.retention_resources(workspace)
+                path.rename(displaced)
+                self.calls.clear()
+                try:
+                    for _ in range(2):
+                        self.assert_observation('missing')
+                    self.assertEqual(self.calls, [])
+                    self.assertEqual(self.retention_resources({**workspace, 'path': str(displaced)}), before)
+                    self.assertEqual(self.registry, before['registry'])
+                    self.assertEqual(self.run, before['run'])
+                    self.assertTrue(displaced.is_dir())
+                    self.assertFalse(path.exists())
+                finally:
+                    displaced.rename(path)
+                self.assertEqual(self.retention_resources(workspace), before)
+
+    def test_retention_changed_branch_is_unknown_for_linked_and_clone(self):
+        for backing in ('linked', 'clone'):
+            with self.subTest(backing=backing):
+                workspace = self.retained_workspace(backing)
+                git(workspace['path'], 'checkout', '-b', f'changed-{backing}')
+                before = self.retention_resources(workspace)
+                for _ in range(2):
+                    self.assert_observation('unknown')
+                self.assertEqual(self.retention_resources(workspace), before)
+
+    def test_retention_changed_common_directory_is_unknown(self):
+        workspace = self.retained_workspace('clone')
+        self.run['workspace']['commonDir'] = self.source['commonDir']
+        before = self.retention_resources(workspace)
+        self.assert_observation('unknown')
+        self.assertEqual(self.retention_resources(workspace), before)
+
+    def test_retention_requires_exact_source_registry_for_each_backing(self):
+        for backing in ('linked', 'clone'):
+            with self.subTest(backing=backing):
+                workspace = self.retained_workspace(backing)
+                exact = copy.deepcopy(self.registry)
+                for rows in ([], [dict(exact[-1], branch='wrong')],
+                             [dict(exact[-1], parentRepo=str(self.home))],
+                             [dict(exact[-1], orphanReason='missing source')],
+                             [exact[-1], exact[-1]]):
+                    self.registry = rows
+                    before = self.retention_resources(workspace)
+                    self.assert_observation('unknown')
+                    self.assertEqual(self.retention_resources(workspace), before)
+                self.registry = exact
+
+    def test_retention_unknown_cli_and_registry_capabilities_preserve_resources(self):
+        workspace = self.retained_workspace('linked')
+        before = self.retention_resources(workspace)
+        failures = (Refusal('unsupported_capability', 'omp CLI is unavailable'),
+                    Refusal('evidence_unavailable', 'omp registry cannot be read'))
+        for failure in failures:
+            with self.subTest(reason=str(failure)):
+                with patch.object(self.provider, '_registry', side_effect=failure):
+                    observation = self.assert_observation('unknown')
+                self.assertIn(str(failure), observation['reason'])
+                self.assertEqual(self.retention_resources(workspace), before)
+        self.registry = {'unsupported': 'registry format'}
+        self.assert_observation('unknown')
+        self.assertTrue(Path(workspace['path']).is_dir())
+
+    def test_retention_unavailable_configured_omp_is_unknown(self):
+        workspace = self.retained_workspace('linked')
+        before = self.retention_resources(workspace)
+        provider = OmpWorkspace(env=self.env, executables={})
+        run = copy.deepcopy(self.run)
+        run['target'] = None
+        observation = provider.observe_retention(run)
+        self.assertEqual(observation['state'], 'unknown')
+        self.assertEqual(self.retention_resources(workspace), before)
+
+    def test_retention_linked_git_registry_must_still_bind_the_recorded_branch(self):
+        workspace = self.retained_workspace('linked')
+        before = self.retention_resources(workspace)
+
+        def without_git_registration(argv, run, **kwargs):
+            if argv == ['git', 'worktree', 'list', '--porcelain', '-z']:
+                return ''
+            return self.cli(argv, run, **kwargs)
+
+        with patch.object(self.provider, '_command', side_effect=without_git_registration):
+            self.assert_observation('unknown')
+        self.assertEqual(self.retention_resources(workspace), before)
+
+    def test_retention_unreadable_or_non_directory_path_is_unknown_not_missing(self):
+        workspace = self.retained_workspace('linked')
+        before = self.retention_resources(workspace)
+        with patch.object(Path, 'lstat', side_effect=PermissionError('operator access required')):
+            observation = self.assert_observation('unknown')
+        self.assertIn('operator access required', observation['reason'])
+        self.assertEqual(self.retention_resources(workspace), before)
+        self.run['workspace']['path'] = str(Path(workspace['path']) / 'source')
+        self.assert_observation('unknown')
+
+    def test_retention_missing_noncanonical_alias_does_not_claim_absence(self):
+        workspace = self.retained_workspace('linked')
+        original_path = Path(workspace['path'])
+        self.run['workspace']['path'] = str(self.home / 'absent' / '..' / 'absent-workspace')
+        self.calls.clear()
+        observation = self.assert_observation('unknown')
+        self.assertEqual(self.calls, [])
+        self.assertTrue(original_path.is_dir())
+
+    def test_retention_changed_or_dangling_symlinks_are_unknown_not_missing(self):
+        workspace = self.retained_workspace('linked')
+        path = Path(workspace['path'])
+        displaced = path.with_name(path.name + '-externally-retained')
+        before = self.retention_resources(workspace)
+        path.rename(displaced)
+        try:
+            path.symlink_to(displaced, target_is_directory=True)
+            self.assert_observation('unknown')
+            self.assertTrue(path.is_symlink())
+            path.rename(path.with_name(path.name + '-retained-alias'))
+            path.symlink_to(self.home / 'absent-target', target_is_directory=True)
+            self.assert_observation('unknown')
+            self.assertTrue(path.is_symlink())
+            self.assertEqual(self.registry, before['registry'])
+            self.assertEqual(self.run, before['run'])
+            self.assertTrue(displaced.is_dir())
+        finally:
+            if path.is_symlink():
+                path.rename(path.with_name(path.name + '-retained-dangling-alias'))
+            displaced.rename(path)
+        self.assertEqual(self.retention_resources(workspace), before)
+
+    def test_retention_without_recorded_workspace_does_not_search_or_allocate(self):
+        self.assert_observation('unknown')
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.registry, [])
+        self.assertEqual(self.add_calls, 0)
+
     def assert_refusal(self, code, action):
         with self.assertRaises(Refusal) as raised:
             action()

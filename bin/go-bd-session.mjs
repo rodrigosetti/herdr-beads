@@ -224,6 +224,14 @@ export default function (pi) {
       `Observed Beads status: ${run.issueObservation?.status ?? 'unknown'} (assignee: ${run.issueObservation?.assignee ?? 'unknown'}, observed: ${run.issueObservation?.observedAt ?? 'never'})`,
       `Merge coverage: ${run.coverage.state}, revision ${run.coverage.revision}, workspace HEAD ${run.coverage.workspaceHead ?? 'unknown'}`,
       `Cleanup: ${run.cleanup.state}; retention reasons: ${run.cleanup.blockers.join(', ') || 'none'}`,
+      `Retention reason: ${run.cleanup.reason ?? 'Automatic cleanup is disabled; resources require separate operator review.'}`,
+      `Workspace observation: ${JSON.stringify(run.cleanup.workspaceObservation ?? { state: 'unknown', reason: 'No provider observation recorded; operator review required.', observedAt: null })}`,
+      `Canonical scope: ${JSON.stringify(run.scope)}`,
+      `Owner and run: ${JSON.stringify({ owner: run.owner, fence: run.fence, revision: run.revision, disposition: run.disposition })}`,
+      `Canonical workspace (recorded identity): ${JSON.stringify(run.workspace)}`,
+      `Explicit release: ${JSON.stringify(run.release)}`,
+      'Automatic cleanup is disabled even after merge, manual closure or explicit release. Release relinquishes ownership; observed closure does not prove this run owned closure. A missing workspace is observed absence only, not cleanup proof. Registrations, transcripts, sessions, spaces, terminals and other resources remain retained. Unknown/unavailable provider observations require operator review.',
+      'The operator may separately review current ownership/activity, tracked, untracked and ignored work, stashes, nested repositories and unpreserved commits, then remove resources externally under the ordinary provider workflow. No cleanup command or action is supplied.',
     ];
     const handoff = closure.state === 'awaiting_manual' ? closure.handoff : null;
     if (handoff) {

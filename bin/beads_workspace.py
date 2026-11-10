@@ -14,6 +14,11 @@ to perform; recovery only observes the exact journaled resource.
 Legacy adoption observes an explicit canonical checkout and its omp/Git
 registrations only. It preserves the checkout's actual branch and does not
 choose an integration destination or provision any resource.
+
+Retention observation only reads the exact canonical recorded resource and
+supported source registrations. Absence is a filesystem observation, not
+cleanup proof; unknown identity or capability requires manual review. No
+observation alters registrations or authorizes resource removal.
 """
 import copy
 import json
@@ -21,7 +26,7 @@ import os
 from pathlib import Path
 import sys
 
-from beads_contract import Refusal, validate
+from beads_contract import Refusal, now, validate
 from beads_identity import canonical_path, command, repository_identity, validate_workspace
 
 
@@ -138,7 +143,7 @@ class OmpWorkspace:
         if len(matches) > 1:
             raise Refusal('workspace_mismatch', 'Multiple omp registry entries bind this workspace path.')
         if require_registry and not matches:
-            raise Refusal('workspace_mismatch', 'Adoption requires one exact omp source registry binding.')
+            raise Refusal('workspace_mismatch', 'Workspace validation requires one exact omp source registry binding.')
         branch = workspace['branchRef'].removeprefix('refs/heads/')
         source = run['scope']['repository']
         for row in matches:
@@ -240,3 +245,30 @@ class OmpWorkspace:
         if not workspace:
             raise Refusal('workspace_missing', 'No acknowledged omp workspace exists.')
         return self._validate(run, workspace, self._registry(run), require_registry=run['target'] is None)
+
+    def observe_retention(self, run):
+        """Observe the exact retained resource; never authorize or perform cleanup."""
+        state = 'unknown'
+        reason = 'No acknowledged workspace is recorded; review the run before locating retained resources.'
+        workspace = run.get('workspace')
+        if workspace:
+            try:
+                validate('run', workspace, 'Workspace')
+                if workspace['sourceRepository'] != run['scope']['repository']:
+                    raise Refusal('workspace_mismatch', 'Workspace source repository differs from this run.')
+                path = canonical_path(workspace['path'], 'workspace_mismatch')
+                try:
+                    path.lstat()
+                except FileNotFoundError:
+                    state = 'missing'
+                    reason = ('The exact recorded workspace path is absent. This is only a filesystem observation; '
+                              'retain registrations and review registrations and ownership externally.')
+                else:
+                    self._source(run, require_target=False)
+                    self._validate(run, workspace, self._registry(run), require_registry=True)
+                    state = 'present'
+                    reason = ('The exact recorded workspace identity and source registrations were validated. '
+                              'The workspace is retained; this observation does not authorize cleanup.')
+            except (Refusal, OSError, RuntimeError) as error:
+                reason = f'Workspace observation is unavailable or mismatched: {error} Review the recorded workspace manually; retain all resources.'
+        return {'state': state, 'reason': reason, 'observedAt': now()}

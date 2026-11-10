@@ -25,6 +25,19 @@ CAPABILITIES = ['launch', 'exact_resume', 'durable_identity', 'owner_activity',
 START_CAPABILITIES = ('launch', 'exact_resume', 'durable_identity', 'owner_activity')
 METHOD_ACTION = {'start_or_focus': 'started', 'resume': 'resumed', 'release': 'release_requested',
                  'reconcile': 'reconciled', 'adopt_legacy': 'adopted'}
+RETENTION_REASON = ('Automatic cleanup is disabled. Manual cleanup is required; merge verification, '
+                    'observed Beads closure and explicit session release never authorize workspace, '
+                    'registration, transcript, terminal or space removal.')
+
+
+def hold_cleanup(run, observation=None):
+    cleanup = run['cleanup']
+    cleanup.update(state='held', reason=RETENTION_REASON, checkedAt=now())
+    if 'manual_cleanup_required' not in cleanup['blockers']:
+        cleanup['blockers'].append('manual_cleanup_required')
+    if observation is not None:
+        cleanup['workspaceObservation'] = copy.deepcopy(observation)
+
 
 
 def key(identity):
@@ -315,7 +328,8 @@ class Controller:
                 'closure': {'state': 'not_requested', 'evidenceIds': [], 'observedAt': None,
                             'reason': 'Integration destination unbound — explicit handoff required.' if target is None else None,
                             'manualCommand': None, 'handoff': None},
-                'cleanup': {'state': 'held', 'blockers': ['manual_cleanup_required'], 'checkedAt': None},
+                'cleanup': {'state': 'held', 'blockers': ['manual_cleanup_required'], 'checkedAt': None,
+                            'reason': RETENTION_REASON},
                 'issueObservation': None, 'createdAt': timestamp, 'updatedAt': timestamp}
 
     def adopt(self, request, doc, run):
@@ -827,36 +841,57 @@ class Controller:
         doc['requests'][request['requestId']] = {'payload': canonical_json(request),
             'operationId': result['operation']['operationId'], 'result': None}
 
+    def retention_observation(self, run):
+        observer = getattr(self.workspace, 'observe_retention', None)
+        if observer is None:
+            return {'state': 'unknown', 'observedAt': now(),
+                    'reason': 'Workspace provider lacks read-only retention observation. Review the recorded '
+                              'workspace and registrations externally; keep all resources.'}
+        try:
+            observation = self.adapter_call(observer, copy.deepcopy(run))
+            validate('run', observation, 'WorkspaceObservation')
+            return observation
+        except Refusal as error:
+            return {'state': 'unknown', 'observedAt': now(),
+                    'reason': f'Workspace observation unavailable ({error.code}): {error.message} '
+                              'Review the recorded workspace/provider externally; keep all resources.'}
+
     def reconcile(self, run, private):
-        issue = self.authority.issue(run['scope'])
-        result = {'issue': {'status': issue['status'], 'assignee': issue.get('assignee') or None, 'observedAt': now()},
-                  'submissions': [], 'head': None, 'clean': False}
-        if issue.get('assignee') != run['owner'] or issue['status'] not in ('in_progress', 'closed'):
-            return result
-        if run['coverage']['required']:
-            # Merge observation needs recorded Git identity, not a live omp
-            # process or workspace provisioning/registry capability. No cleanup
-            # authority is derived from this read-only check.
-            if not run['workspace']:
-                raise Refusal('workspace_missing', 'No recorded submission workspace exists.')
-            validate_workspace(run['workspace'], run['scope'])
-            path = run['workspace']['path']
-            if not self.integration:
-                result['error'] = {'code': 'evidence_unavailable', 'message': 'No authoritative integration observer installed; prior proof is audit-only.'}
-            else:
-                try:
-                    result['submissions'] = self.integration.observe(copy.deepcopy(run), copy.deepcopy(private.get('integrationReceipts', [])))
-                except Refusal as error:
-                    result['error'] = {'code': error.code, 'message': error.message}
-            # Provider IO may be slow: sample coverage after it, not only before it.
-            validate_workspace(run['workspace'], run['scope'])
-            result['head'] = command(['git', 'rev-parse', 'HEAD'], path)
-            result['clean'] = not command(['git', 'status', '--porcelain', '--untracked-files=all'], path)
+        result = {'workspaceObservation': self.retention_observation(run),
+                  'issue': None, 'submissions': [], 'head': None, 'clean': False}
+        try:
             issue = self.authority.issue(run['scope'])
             result['issue'] = {'status': issue['status'], 'assignee': issue.get('assignee') or None, 'observedAt': now()}
+            if issue.get('assignee') != run['owner'] or issue['status'] not in ('in_progress', 'closed'):
+                return result
+            if run['coverage']['required']:
+                # Integration observes neutral Git identity, independently of
+                # provider retention capability. Neither observation authorizes removal.
+                if not run['workspace']:
+                    raise Refusal('workspace_missing', 'No recorded submission workspace exists.')
+                validate_workspace(run['workspace'], run['scope'])
+                path = run['workspace']['path']
+                if not self.integration:
+                    raise Refusal('evidence_unavailable', 'No authoritative integration observer installed; prior proof is audit-only.')
+                result['submissions'] = self.integration.observe(copy.deepcopy(run), copy.deepcopy(private.get('integrationReceipts', [])))
+                # Provider IO may be slow: sample coverage after it, not only before it.
+                validate_workspace(run['workspace'], run['scope'])
+                result['head'] = command(['git', 'rev-parse', 'HEAD'], path)
+                result['clean'] = not command(['git', 'status', '--porcelain', '--untracked-files=all'], path)
+                issue = self.authority.issue(run['scope'])
+                result['issue'] = {'status': issue['status'], 'assignee': issue.get('assignee') or None, 'observedAt': now()}
+        except Refusal as error:
+            result['error'] = {'code': error.code, 'message': error.message}
         return result
 
     def apply_reconcile(self, run, receipt, doc):
+        observation = receipt.get('workspaceObservation')
+        if observation is not None:
+            validate('run', observation, 'WorkspaceObservation')
+        hold_cleanup(run, observation)
+        if receipt['issue'] is None:
+            self.invalidate(run, doc, receipt['error']['message'])
+            return
         issue = receipt['issue']
         validate('run', issue, 'IssueObservation')
         previous = run['issueObservation']
@@ -936,7 +971,7 @@ class Controller:
         if issue['status'] == 'closed':
             run['closure'].update(state='observed_closed',
                 reason='Externally closed — observed only; no run closure ownership or integration inferred.')
-        run['cleanup'] = {'state': 'held', 'blockers': ['manual_cleanup_required'], 'checkedAt': now()}
+        hold_cleanup(run)
 
     @staticmethod
     def manual_handoff(run, verified):
@@ -980,4 +1015,4 @@ class Controller:
                 submission.update(state='unknown', evidence=None, observedAt=now())
         run['coverage']['state'] = 'unknown' if run['coverage']['required'] else 'unsubmitted'
         run['closure'].update(state='held', evidenceIds=[], manualCommand=None, handoff=None, reason=reason)
-        run['cleanup'] = {'state': 'held', 'blockers': ['manual_cleanup_required'], 'checkedAt': now()}
+        hold_cleanup(run)

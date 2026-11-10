@@ -171,7 +171,9 @@ The lifecycle controller below verifies integration and prepares an evidence-bac
 
 The owner reviews the current canonical database, full issue ID, ownership/run/submission, target, and merge evidence, then separately executes normal `bd close --reason …` without `--force`. Manual closure retains Beads' existing concurrency limitations: it is not atomically guarded against reopen, reassignment, or a newer run. A Herdr lock or a preceding status check does not remove that race. Observing an externally closed issue is not proof that a particular run owned its closure.
 
-Automatic Bead closure, closure retries, workspace deletion, and destructive registry/terminal cleanup remain disabled, including after manual closure or explicit session release. Workspaces and transcripts stay intact for separate operator review and manual cleanup. The lifecycle delivery must keep retained resources inspectable after their Bead closes. Guarded automation is optional backlog (`herdr-beads-6yd`), not a release prerequisite; no upstream Beads patch or database topology change is required for the manual-completion scope.
+Automatic Bead closure, closure retries, workspace deletion, pruning, and destructive registration/space/terminal/transcript cleanup remain disabled, including after verified merge, manual closure or explicit session release. Explicit release relinquishes session ownership; it does not establish integration, Beads closure or cleanup authorization. Observed external closure is only a timestamped issue observation, not a run-owned closure receipt. Workspaces, registrations, sessions and transcripts remain retained and inspectable after the Bead closes and across service restarts; restart reconciliation does not delete them.
+
+Workspace observation is also not cleanup proof. `missing` records observed absence without removing the canonical workspace identity, provider registration or other retained resources. `unknown` means observation is unavailable or inconclusive (including unsupported provider capabilities) and requires actionable operator review, not a guessed absence. An operator may separately review current ownership/activity, tracked, untracked and ignored work, stashes, nested repositories and unpreserved commits, then remove resources externally under the ordinary provider workflow. The controller, dashboard and session context provide no destructive cleanup command or button. Guarded automation is optional backlog (`herdr-beads-6yd`), not a release prerequisite; no upstream Beads patch or database topology change is required for the manual-completion scope.
 
 ## Durable local controller
 
@@ -191,7 +193,11 @@ The controller retains the existing machine UUID independently of the retired la
 
 ### Versioned requests and independent state
 
-The complete wire shapes live in `schemas/v1/{controller,run,adapter}.schema.json`. Every request has `apiVersion:1`, a unique `requestId`, canonical `scope`, `method`, and typed `params`. For example, status has no mutation precondition:
+The complete wire shapes live in `schemas/v1/{controller,run,adapter}.schema.json`. Every request has `apiVersion:1`, a unique `requestId`, canonical `scope`, `method`, and typed `params`.
+
+The durable version-1 `Cleanup` record adds optional `reason` (explicit automatic-cleanup-disabled retention prose) and `workspaceObservation: {state, reason, observedAt}` fields. Observation state is `present`, `missing` or `unknown`, its reason is nonempty review context, and `observedAt` is a date-time. Older stored records without these fields remain valid; surfaces show unknown/no recorded observation until observation is available, not fabricated historical evidence. These additive fields do not replace `run.workspace`: its exact canonical provider, backing, path, branch, source and common directory remain authoritative alongside `run.scope`, owner and fence. Saved observations survive restart but are timestamped snapshots, not fresh ownership/activity checks or a comprehensive inventory of work to preserve. Retained closed runs remain available to lifecycle inspection independently of open-issue lists. The lifecycle details and `/bead-context` expose the retention reason and workspace observation without granting cleanup authority.
+
+For example, status has no mutation precondition:
 
 ```json
 {
@@ -359,6 +365,10 @@ Concrete adapter smoke (2026-11-09, omp 18.17): actual Herdr start → focus →
 Additional observer acceptance exercised real offline normal/fast-forward merges and exact local squash receipts (including reset invalidation), plus genuine provider records for [merge](https://github.com/kubernetes/kubernetes/pull/143983), [squash](https://github.com/python/cpython/pull/161674) and [rebase](https://github.com/zulip/zulip/pull/40635). These are independent adapter observations, not a claim that this project's run was merged or that managed-project/UI cutover passed.
 
 Manual-handoff smoke additionally exercised a real disposable Beads database: offline verified integration → stable command after restart/reconciliation → separately executed normal owner close → observed external closure → reopen without reclosure, retaining the workspace. A genuine read-only [cli/cli#8294](https://github.com/cli/cli/pull/8294) submission imported into a disposable checkout produced the PR handoff and survived restart. Actual omp 18.17 TUI `/bead-context` rendered its verified status, concurrency warning and copyable command without a model turn or closure action. These are disposable policy/presentation acceptance tracks, not creation/merge of a new managed-project PR or installed dashboard cutover.
+
+Retention smoke (2026-11-10) used two isolated real Beads databases and the actual socket service: offline local-target verification and genuine read-only [cli/cli#8294](https://github.com/cli/cli/pull/8294) evidence both reached manual handoff. Separate fixture-owner closure removed the issues from open lists; service restart retained their directories, Git registrations and byte-identical transcript files. An external rename of the disposable local directory produced `missing`/`held`, retained its exact stale registration and still recorded external closure. Plain Git worktrees outside the provider's source registry reported actionable `unknown`, not cleanup success. Service regressions also cover linked and independent-clone backing in both modes, explicit release, dirty/untracked/ignored work, stashes, nested repositories and changed identity.
+
+All three source native mods passed initial-render checks. A dedicated source retention pane opened without app errors, but the native screenshot API returned a stale pre-smoke frame and desktop capture was black; this run does not claim visual acceptance or an installed dashboard cutover.
 
 
 ## Verification

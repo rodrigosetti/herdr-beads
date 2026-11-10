@@ -58,8 +58,12 @@ export function lifecycleMarkdown(response, { available = true } = {}) {
       "### Required coverage and blockers", fenced({ coverage: run.coverage, blockers: requiredSubmissions(run).filter(({ state }) => state !== "integrated").map(({ identity, state, observedAt }) => ({ submissionId: identity.submissionId, submissionRevision: identity.submissionRevision, state, observedAt })), closure: { state: run.closure?.state, reason: run.closure?.reason, evidenceIds: run.closure?.evidenceIds, observedAt: run.closure?.observedAt } }),
       "### Submissions, exact heads, PRs and evidence", fenced(run.submissions),
       "### Observed Beads issue", "Timestamped observation only; external closure does not establish integration or controller closure ownership.", fenced(run.issueObservation),
-      "### Cleanup — resources retained", "No workspace, branch, registry, session or terminal is removed. Integration, closure and owner release do not authorize cleanup.", fenced({ cleanup: run.cleanup, release: run.release }),
-      "### Workspace", fenced(run.workspace),
+      "### Cleanup — resources retained", "Automatic cleanup is disabled, including after merge, manual closure or explicit owner release. No workspace, branch, registration, transcript, session, space or terminal is removed.", fenced({ state: run.cleanup?.state, blockers: run.cleanup?.blockers, checkedAt: run.cleanup?.checkedAt, release: run.release }),
+      "### Retention reason", fenced(run.cleanup?.reason ?? "Automatic cleanup is disabled; resources require separate operator review.", "text"),
+      "### Workspace observation", fenced(run.cleanup?.workspaceObservation ?? { state: "unknown", reason: "No provider observation recorded; operator review required.", observedAt: null }),
+      "Missing means observed absence only, not cleanup proof; registrations and other resources remain retained. Unknown or unavailable provider observations require review. Neither observation nor explicit release authorizes cleanup.",
+      "An operator may separately review current ownership/activity, tracked, untracked and ignored work, stashes, nested repositories and unpreserved commits, then remove resources externally under the ordinary provider workflow. No cleanup command or action is supplied here.",
+      "### Canonical workspace (recorded identity)", fenced(run.workspace),
     );
   }
   sections.push("### Durable operation", fenced(response?.operation), "### Controller result and capabilities", fenced({ outcome: response?.outcome, action: response?.action, error: response?.error ?? null, actions: response?.actions ?? [], support: response?.support ?? null }));

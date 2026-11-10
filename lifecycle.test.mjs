@@ -119,6 +119,29 @@ test("lifecycle markdown exposes exact scope, durable operation, evidence and re
   assert.ok(markdown.includes(value.run.closure.manualCommand));
 });
 
+test("workspace observations preserve recorded identity and do not authorize closure", () => {
+  for (const state of ["present", "missing", "unknown"]) {
+    const value = response({
+      workspace: { provider: "omp-worktree", backing: "linked", path: "/canonical/worktree", branchRef: "refs/heads/full-issue.1", sourceRepository: target.repository, commonDir: "/repo/.git" },
+      cleanup: {
+        state: "held", blockers: ["manual_cleanup_required"],
+        reason: "retention-policy-for-this-run",
+        workspaceObservation: { state, reason: `provider-observation-${state}`, observedAt: "2026-11-10T10:00:00Z" },
+      },
+      closure: { state: "observed_closed", manualCommand: null },
+      release: { state: "released", receipt: null },
+    });
+    const before = structuredClone(value);
+    const markdown = lifecycleMarkdown(value);
+    const records = [...markdown.matchAll(/^(`{3,})json\n([\s\S]*?)\n\1$/gm)].map((match) => JSON.parse(match[2]));
+    assert.ok(records.some((record) => JSON.stringify(record) === JSON.stringify(value.run.workspace)));
+    assert.ok(records.some((record) => JSON.stringify(record) === JSON.stringify(value.run.cleanup.workspaceObservation)));
+    assert.deepEqual(retainedRuns([value]), [value]);
+    assert.equal(manualClosureCommand(value), null);
+    assert.deepEqual(value, before);
+  }
+});
+
 test("PR identity, exact head and provider evidence remain inspectable", () => {
   const value = submitted("open", "github-pr");
   value.run.submissions[0].identity = { ...identity, pullRequest: { number: 17, url: "https://github.example/org/repo/pull/17" } };

@@ -1180,9 +1180,34 @@
         "capability_unsupported"
       ]
     },
+    "WorkspaceObservation": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "enum": ["present", "missing", "unknown"]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "observedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["state", "reason", "observedAt"],
+      "additionalProperties": false
+    },
     "Cleanup": {
       "type": "object",
       "properties": {
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspaceObservation": {
+          "$ref": "#/$defs/WorkspaceObservation"
+        },
         "state": {
           "const": "held"
         },

@@ -143,7 +143,7 @@ class LifecycleServer(ControllerServer):
                 operation = self.controller.latest(doc, run)
                 runs.append({k: copy.deepcopy(run[k]) for k in (
                     'scope', 'fence', 'owner', 'disposition', 'target', 'submissions',
-                    'coverage', 'closure', 'cleanup', 'issueObservation')})
+                    'coverage', 'closure', 'cleanup', 'issueObservation', 'workspace', 'release', 'execution')})
                 visible = [op['public'] for op in doc['operations'].values()
                            if op['public']['fence']['runId'] == run['fence']['runId']
                            and op['public']['state'] in ('pending', 'running')]
