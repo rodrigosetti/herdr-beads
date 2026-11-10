@@ -78,16 +78,3 @@ export function lifecycleMarkdown(response, { available = true } = {}) {
   }
   return sections.join("\n\n");
 }
-
-export function retainedRuns(responses) {
-  return responses.filter((response) => {
-    const run = response?.run;
-    return run && (run.cleanup?.state === "held" || run.closure?.state === "observed_closed" || run.closure?.state === "awaiting_manual" || run.closure?.state === "held" || run.disposition !== "current" || run.release?.state === "released" || run.coverage?.required?.length || response.operation?.state === "failed");
-  }).sort((a, b) => {
-    const timestamp = (response) => {
-      const parsed = Date.parse(response.run.updatedAt ?? response.run.createdAt ?? "");
-      return Number.isFinite(parsed) ? parsed : 0;
-    };
-    return timestamp(b) - timestamp(a);
-  });
-}

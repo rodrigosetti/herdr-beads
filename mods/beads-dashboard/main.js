@@ -2,7 +2,7 @@ import { View, div } from "gpui-kit";
 import { v_flex, h_flex, v_virtual_list, VirtualListScrollHandle, Scrollbar, TextView, EditorState, Editor } from "gpui-base";
 import { agents, exec, focused, home, nextCommand, panes, props, run, setShared, shared, spaces, terminals, theme } from "herdr";
 import { issueAction, issueRows, issueSessions, sessionLabels, statusLabels } from "./model.js";
-import { lifecycleLabel, targetLabel, lifecycleMarkdown, manualClosureCommand, retainedRuns } from "./lifecycle.js";
+import { lifecycleLabel, targetLabel, lifecycleMarkdown, manualClosureCommand } from "./lifecycle.js";
 import installation from "./installation.js";
 
 function preferences(key) {
@@ -30,7 +30,6 @@ export default class BeadsDashboard extends View {
     this.service = { available: false, error: "Connecting to local lifecycle service…" };
     this.lifecycle = new Map();
     this.pendingRequests = {};
-    this.lifecycleOpen = false;
     this.lifecycleId = null;
     this.editor = null;
     this.editorKind = null;
@@ -82,7 +81,6 @@ export default class BeadsDashboard extends View {
         else if (command.startsWith("select:")) this.select(command.slice(7), cx);
         else if (command.startsWith("start:")) this.launch(command.slice(6), cx);
         else if (command.startsWith("lifecycle:")) this.inspectLifecycle(command.slice(10), cx);
-        else if (command === "lifecycle") { this.lifecycleOpen = !this.lifecycleOpen; }
         else if (command === "configure") this.editTarget(cx);
         else if (command === "operation:handoff") this.prepareHandoff(cx);
         else if (command === "operation:submit") this.submitEditor(cx);
@@ -244,7 +242,10 @@ export default class BeadsDashboard extends View {
 
   setMode(mode, cx) {
     this.mode = mode;
-    this.lifecycleOpen = false;
+    this.lifecycleId = null;
+    this.editor?.release();
+    this.editor = null;
+    this.editorKind = null;
     this.save();
     cx.notify();
   }
@@ -335,7 +336,6 @@ export default class BeadsDashboard extends View {
 
 
   inspectLifecycle(id, cx) {
-    this.lifecycleOpen = true;
     this.lifecycleId = id;
     this.editorKind = null;
     this.editor?.release();
@@ -529,19 +529,13 @@ export default class BeadsDashboard extends View {
   }
 
   lifecyclePanel(t) {
-    const responses = retainedRuns([...this.lifecycle.values()]);
     const response = this.lifecycle.get(this.lifecycleId);
     const current = response?.run;
     const actions = response?.actions ?? [];
     const enabled = (method) => this.service.available && !this.starting.has(this.lifecycleId) && actions.some((action) => action.method === method && action.enabled);
     const command = this.service.available ? manualClosureCommand(response) : null;
     return v_flex().id("lifecycle-panel").flex_1().min_h(0).overflow_y_scrollbar().p(16).gap(10)
-      .child(div().font_semibold().child("Run lifecycle · retained workspaces"))
-      .child(div().text_size(11).text_color(t.muted).child("Independent of Working / Needs you / Done unseen / Idle. No automatic closure or resource deletion."))
-      .children(responses.map((item) => this.button(`retained-${item.run.fence.runId}`,
-        `${item.run.scope.issueId} · ${lifecycleLabel(item)} · ${item.run.cleanup.blockers.join(", ")}`,
-        (cx) => this.inspectLifecycle(item.run.scope.issueId, cx), t, item.run.scope.issueId === this.lifecycleId)))
-      .when(!responses.length && !this.lifecycleId, (element) => element.child(div().text_color(t.muted).child("No retained runs in this project. Open an issue's Actions to configure and start omp.")))
+      .child(this.button("back-to-issues", "Back to issues", (cx) => this.setMode(this.mode, cx), t))
       .when(!!this.lifecycleId, (element) => element
         .child(div().font_semibold().child(`${this.lifecycleId} · ${lifecycleLabel(response)}`))
         .when(!!this.pendingRequests[this.lifecycleId], (element) => element.child(div().text_color(t.blocked)
@@ -602,9 +596,8 @@ export default class BeadsDashboard extends View {
             .child(div().truncate().text_size(12).text_color(t.muted).tooltip(this.project?.folder ?? this.folder ?? "").child(`${name}${this.machine ? ` · ${this.machine}` : ""}`)))
           .child(this.button("refresh-beads", this.loading ? "Refreshing…" : "Refresh", (cx) => this.refresh(cx), t)))
         .child(h_flex().gap(8).items_center()
-          .child(this.button("filter-all", `All open · ${counts.all}`, (cx) => this.setMode("all", cx), t, this.mode === "all"))
-          .child(this.button("filter-ready", `Ready · ${counts.ready}`, (cx) => this.setMode("ready", cx), t, this.mode === "ready" && !this.lifecycleOpen))
-          .child(this.button("filter-lifecycle", `Lifecycle · ${retainedRuns([...this.lifecycle.values()]).length}`, (cx) => { this.lifecycleOpen = !this.lifecycleOpen; cx.notify(); }, t, this.lifecycleOpen)))
+          .child(this.button("filter-all", `All open · ${counts.all}`, (cx) => this.setMode("all", cx), t, this.mode === "all" && !this.lifecycleId))
+          .child(this.button("filter-ready", `Ready · ${counts.ready}`, (cx) => this.setMode("ready", cx), t, this.mode === "ready" && !this.lifecycleId)))
         .child(div().text_size(11).text_color(t.muted).child("Execution: omp only · separate omp worktree registry required · linked Git workspaces only."))
         .child(div().text_size(11).text_color(t.muted).child(this.loaded ? `${count} ${count === 1 ? "issue" : "issues"} · ${sessions.size} with agent attention` : "Loading project…")))
       .when(!!this.error, (element) => element.child(div().flex_none().px(16).py(10).bg(t.surface).text_color(t.blocked).child(`${this.error}${this.loaded ? " — showing last successful refresh" : ""}`)))
@@ -613,8 +606,8 @@ export default class BeadsDashboard extends View {
         .child(`${this.service.error?.message ?? this.service.error ?? "Lifecycle service unavailable."} — lifecycle snapshot is last-good/read-only; browsing remains available. No local-launch fallback.`)))
       .when(!!this.operationError, (element) => element.child(div().flex_none().px(16).py(10).bg(t.surface).text_color(t.blocked).child(`Lifecycle operation: ${this.operationError}`)))
       .when(!!this.notice, (element) => element.child(div().flex_none().px(16).py(8).text_size(12).text_color(t.done).child(this.notice)))
-      .when(this.lifecycleOpen, (element) => element.child(this.lifecyclePanel(t)))
-      .when(!this.lifecycleOpen, (element) => element.child(v_flex().id("beads-viewport").flex_1().min_h(0).relative().overflow_hidden()
+      .when(!!this.lifecycleId, (element) => element.child(this.lifecyclePanel(t)))
+      .when(!this.lifecycleId, (element) => element.child(v_flex().id("beads-viewport").flex_1().min_h(0).relative().overflow_hidden()
         .on_size_change((size, cx) => {
           if (this.viewportHeight !== size.height) { this.viewportHeight = size.height; cx.notify(); }
         })

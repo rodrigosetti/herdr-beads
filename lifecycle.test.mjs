@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { lifecycleLabel, lifecycleMarkdown, manualClosureCommand, retainedRuns, targetLabel } from "./mods/beads-dashboard/lifecycle.js";
+import { lifecycleLabel, lifecycleMarkdown, manualClosureCommand, targetLabel } from "./mods/beads-dashboard/lifecycle.js";
 
 const target = { mode: "local-target", repository: { root: "/repo", commonDir: "/repo/.git" }, ref: "refs/heads/main" };
 const identity = { submissionId: "submission-1", submissionRevision: 2, head: "a".repeat(40), target, pullRequest: null };
@@ -136,7 +136,6 @@ test("workspace observations preserve recorded identity and do not authorize clo
     const records = [...markdown.matchAll(/^(`{3,})json\n([\s\S]*?)\n\1$/gm)].map((match) => JSON.parse(match[2]));
     assert.ok(records.some((record) => JSON.stringify(record) === JSON.stringify(value.run.workspace)));
     assert.ok(records.some((record) => JSON.stringify(record) === JSON.stringify(value.run.cleanup.workspaceObservation)));
-    assert.deepEqual(retainedRuns([value]), [value]);
     assert.equal(manualClosureCommand(value), null);
     assert.deepEqual(value, before);
   }
@@ -168,18 +167,4 @@ test("untrusted strings cannot terminate markdown fences or create active markdo
     else assert.ok(!line.includes("forged heading") && !line.includes("javascript:bad") && !line.includes("<script>"), line);
   }
   assert.equal(fence, null);
-});
-
-test("retained lifecycle responses include closed and held runs, stable newest-first without mutating input", () => {
-  const old = response({ updatedAt: "2026-01-01T00:00:00Z", closure: { state: "observed_closed" }, cleanup: null });
-  const manual = integrated();
-  const tied = response({ fence: { runId: "tie" }, updatedAt: manual.run.updatedAt });
-  const released = response({ updatedAt: "2025-01-01T00:00:00Z", cleanup: null, release: { state: "released" } });
-  const noSurface = response({ cleanup: null });
-  const input = [old, manual, null, { run: null }, tied, released, noSurface];
-  assert.deepEqual(retainedRuns(input), [manual, tied, old, released]);
-  assert.deepEqual(input, [old, manual, null, { run: null }, tied, released, noSurface]);
-  // Scope filtering is the bridge's responsibility, never inferred from an issue-ID prefix.
-  const otherScope = response({ scope: { beadsDir: "/other/.beads", issueId: "same-id", machineId: "remote" } });
-  assert.deepEqual(retainedRuns([otherScope]), [otherScope]);
 });
