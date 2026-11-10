@@ -53,16 +53,20 @@ export function issueRows(issues, ready, { mode = "all", folded = new Set(), rev
   return { rows, count: matches.length, counts: { all: open.length, ready: readyIssues.length } };
 }
 
-export function issueAction(issue, { session, blocked = false, context = issue.context } = {}) {
-  if (session) return "focus";
-  if (issue.issue_type === "epic") return null;
-  if (context || blocked || !["open", "in_progress"].includes(issue.status)) return null;
-  // Presence, not validity: the launcher must report malformed saved sessions.
-  if (issue.status === "in_progress" && Object.prototype.hasOwnProperty.call(issue.metadata ?? {}, "omp_session")) return "resume";
+export function issueAction(issue, { response, blocked = false, context = issue.context, available = true } = {}) {
+  if (!available || !response || response.outcome === "refused") return null;
+  const enabled = (method) => response.actions?.some((action) => action.method === method && action.enabled === true);
+  const run = response.run;
+  if (run) {
+    if (run.disposition !== "current") return null;
+    if (run.execution?.activity === "active" && enabled("start_or_focus")) return "focus";
+    if (run.execution?.activity === "inactive" && !["preparing", "starting", "released"].includes(run.execution?.state) && enabled("resume")) return "resume";
+    return null;
+  }
+  if (!enabled("start_or_focus") || context || blocked || issue.issue_type === "epic" || !["open", "in_progress"].includes(issue.status)) return null;
   return "start";
 }
 
-const shells = new Set(["sh", "bash", "zsh", "fish", "nu", "dash", "ksh", "pwsh", "powershell", "cmd"]);
 const urgency = { blocked: 0, done: 1, working: 2, idle: 3, starting: 4 };
 
 export function issueSessions(beads, machine, terminals, agents) {
@@ -74,11 +78,9 @@ export function issueSessions(beads, machine, terminals, agents) {
     if ((address.includes("/") ? address.slice(0, address.indexOf("/")) : null) !== (machine ?? null)) continue;
     const id = terminal.labels?.["beads.issue"];
     if (!id) continue;
-    const foreground = terminal.foreground?.name?.split(/[\\/]/).pop()?.replace(/\.exe$/i, "");
-    if (shells.has(foreground)) continue;
     const agent = liveAgents.get(address);
-    if (!agent && foreground !== "omp") continue;
-    const session = { address, status: agent?.status ?? "starting", title: agent?.title ?? terminal.title ?? "", agent: !!agent };
+    if (!agent) continue;
+    const session = { address, status: agent.status, title: agent.title ?? terminal.title ?? "", agent: true };
     if (!sessions.has(id)) sessions.set(id, []);
     sessions.get(id).push(session);
   }

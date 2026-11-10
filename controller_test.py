@@ -348,6 +348,43 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(result['error']['code'], 'unsupported_capability')
         self.assertIsNone(self.store.read(self.scope)['current'])
 
+    def test_status_advertises_start_without_reserving_or_launching(self):
+        response = self.status()
+        self.assertEqual(response['actions'], [
+            {'method': 'start_or_focus', 'enabled': True, 'refusal': None}])
+        self.assertIsNone(response['run'])
+        self.assertIsNone(self.store.read(self.scope)['current'])
+        self.assertEqual(self.execution.launches, 0)
+
+    def test_status_start_availability_matches_each_required_capability(self):
+        for missing in ('launch', 'exact_resume', 'durable_identity', 'owner_activity'):
+            with self.subTest(capability=missing):
+                self.execution.capabilities = [capability for capability in CAPABILITIES if capability != missing]
+                action = self.status()['actions'][0]
+                self.assertEqual(action, {'method': 'start_or_focus', 'enabled': False,
+                                          'refusal': 'unsupported_capability'})
+                refusal = self.controller.handle(self.start_request())
+                self.assertEqual(refusal['error']['capability'], missing)
+        self.assertIsNone(self.store.read(self.scope)['current'])
+        self.assertEqual(self.execution.launches, 0)
+
+    def test_retained_status_advertises_pending_and_capability_refusals(self):
+        self.controller.handle(self.start_request())
+        actions = self.status()['actions']
+        self.assertTrue(all(not action['enabled'] and action['refusal'] == 'pending_operation'
+                            for action in actions))
+        self.drain()
+        self.execution.capabilities = ['launch', 'exact_resume', 'durable_identity', 'owner_activity']
+        actions = {action['method']: action for action in self.status()['actions']}
+        self.assertTrue(actions['start_or_focus']['enabled'])
+        self.assertEqual(actions['handoff']['refusal'], 'unsupported_capability')
+        self.assertEqual(actions['release']['refusal'], 'unsupported_capability')
+        self.assertEqual(actions['resume']['refusal'], 'session_owned')
+        self.execution.capabilities = []
+        actions = {action['method']: action for action in self.status()['actions']}
+        self.assertEqual(actions['start_or_focus']['refusal'], 'unsupported_capability')
+        self.assertTrue(actions['reconcile']['enabled'])
+
 
     def test_start_requires_only_concrete_execution_capabilities(self):
         self.execution.capabilities = ['launch', 'exact_resume', 'durable_identity', 'owner_activity']
@@ -702,6 +739,31 @@ class LifecycleTests(unittest.TestCase):
         retained = self.store.read(self.scope)['private'][run_id]
         self.assertEqual(retained['sequence'], 2)
         self.assertEqual(self.status()['run']['execution']['state'], 'running')
+
+    def test_recovered_launch_preserves_callback_binding_and_accepts_next_turn(self):
+        accepted = self.controller.handle(self.start_request())
+        self.controller.work_once()
+        self.controller.work_once()
+        self.execution.crash = True
+        with self.assertRaises(SystemExit):
+            self.controller.work_once()
+        operation_id = accepted['operation']['operationId']
+        observation = json.loads((self.home / operation_id).read_text())['observation']
+        run_id = accepted['run']['fence']['runId']
+        credential = self.store.read(self.scope)['private'][run_id]['credential']
+        bound = self.call('observe', {'credential': credential, 'observation': observation})
+        self.assertEqual(bound['run']['execution']['state'], 'idle')
+        self.controller = self.restart()
+        self.execution.crash = False
+        self.drain()
+        self.assertEqual(self.status()['run']['execution']['state'], 'idle')
+        observation = copy.deepcopy(observation)
+        observation.update(eventId='next-turn', sequence=observation['sequence'] + 1)
+        observation['event'] = {'kind': 'activity', 'activity': 'active', 'turn': 'working'}
+        active = self.call('observe', {'credential': credential, 'observation': observation})
+        self.assertEqual(active['outcome'], 'ok', active)
+        self.assertEqual(active['run']['execution']['state'], 'running')
+        self.assertEqual(self.execution.launches, 1)
 
     def test_prelaunch_failure_can_be_explicitly_released_without_workspace(self):
         def fail(step, run, intent, private):

@@ -98,24 +98,51 @@ class Controller:
             raise Refusal('owner_mismatch', 'Only the original local owner may focus or resume this retained attempt.')
 
     def success(self, request, run, operation=None, action='status'):
+        support = self.support()
+        supported = support['execution']['supported']
         actions = []
-        if run:
-            for method in ('resume', 'handoff', 'release', 'reconcile'):
-                refusal = None
-                if run['disposition'] != 'current':
-                    refusal = 'issue_changed'
-                elif method in ('resume', 'handoff') and run['release']['state'] == 'released':
-                    refusal = 'run_released'
-                elif method == 'handoff' and run['execution']['access'] != 'writable':
+        methods = ('start_or_focus', 'resume', 'handoff', 'release', 'reconcile') if run else ('start_or_focus',)
+        for method in methods:
+            refusal = None
+            capabilities = {
+                'start_or_focus': START_CAPABILITIES,
+                'resume': ('exact_resume', 'durable_identity', 'owner_activity'),
+                'handoff': ('structured_handoff',),
+                'release': ('explicit_release', 'durable_identity', 'owner_activity'),
+                'reconcile': (),
+            }[method]
+            if operation and operation['state'] in ('pending', 'running'):
+                refusal = 'pending_operation'
+            elif method != 'reconcile' and run and run['disposition'] != 'current':
+                refusal = 'issue_changed'
+            elif method != 'reconcile' and run and run['release']['state'] == 'released':
+                refusal = 'run_released'
+            elif any(capability not in supported for capability in capabilities):
+                refusal = 'unsupported_capability'
+            elif method == 'start_or_focus' and not self.workspace:
+                refusal = 'unsupported_capability'
+            elif run:
+                if method in ('start_or_focus', 'resume', 'handoff') and not run['workspace']:
+                    refusal = 'workspace_missing'
+                elif method == 'handoff' and (run['execution']['access'] != 'writable' or run['release']['state'] != 'held'):
                     refusal = 'run_read_only'
-                elif method in ('resume', 'handoff', 'release') and {
-                        'resume': 'exact_resume', 'handoff': 'structured_handoff',
-                        'release': 'explicit_release'}[method] not in self.support()['execution']['supported']:
+                elif method == 'resume' and not run['execution']['session']:
+                    refusal = 'session_missing'
+                elif method == 'resume' and run['execution']['activity'] != 'inactive':
+                    refusal = 'session_owned'
+                elif method == 'resume' and run['execution']['access'] == 'read_only' and 'read_only' not in supported:
                     refusal = 'unsupported_capability'
-                actions.append({'method': method, 'enabled': refusal is None, 'refusal': refusal})
+                elif method == 'start_or_focus' and run['execution']['activity'] == 'unknown':
+                    refusal = 'session_owned'
+                elif method == 'start_or_focus' and run['execution']['activity'] == 'inactive':
+                    if not run['execution']['session']:
+                        refusal = 'session_missing'
+                    elif run['execution']['access'] != 'writable':
+                        refusal = 'run_read_only'
+            actions.append({'method': method, 'enabled': refusal is None, 'refusal': refusal})
         return {'apiVersion': 1, 'requestId': request['requestId'], 'outcome': 'ok', 'action': action,
                 'run': copy.deepcopy(run), 'operation': copy.deepcopy(operation),
-                'actions': actions, 'support': self.support()}
+                'actions': actions, 'support': support}
 
     @staticmethod
     def failure(request_id, error, run=None, operation=None):
@@ -596,7 +623,9 @@ class Controller:
             public.update(state='running', phase={'claim': 'reserved', 'workspace': 'workspace', 'launch': 'launch',
                           'resume': 'launch', 'focus': 'inspecting', 'release': 'releasing',
                           'read_only': 'binding', 'reconcile': 'verifying'}[step], updatedAt=now())
-            if step in ('launch', 'resume'):
+            # Recovery may follow an accepted binding/activity callback. Never
+            # rewind that acknowledged session to starting while observing its receipt.
+            if step in ('launch', 'resume') and not recovering:
                 run['execution']['state'] = 'starting'
                 touch(run)
             snapshot = copy.deepcopy(run)
