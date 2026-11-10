@@ -218,7 +218,8 @@ def request(value, socket_path=None, *, deadline=None):
             _check_peer(connection)
             connection.settimeout(_remaining(deadline))
             connection.sendall(data)
-            connection.shutdown(socket.SHUT_WR)
+            # The newline ends the request. A fast peer may already have closed;
+            # SHUT_WR can then fail on Darwin even with its response buffered.
             try:
                 response = _read_frame(connection, MAX_RESPONSE_BYTES, deadline)
             except TransportError as exc:

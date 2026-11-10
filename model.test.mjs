@@ -133,82 +133,90 @@ test("closed ancestors can provide context and parent cycles cannot hide work", 
   assert.deepEqual(new Set(result.rows.map(({ issue }) => issue.id)), new Set(["closed", "child", "a", "b"]));
 });
 
-test("sessions are scoped to database and machine, ignoring recovered shells", () => {
-  const terminal = (address, project, name = "omp") => ({ address, state: "live", labels: { "beads.project": project, "beads.issue": "same-id" }, foreground: { name } });
-  const terminals = [terminal("t1", "/one/.beads"), terminal("t2", "/two/.beads"), terminal("remote/t3", "/one/.beads"), terminal("t4", "/one/.beads", "zsh")];
-  const agents = terminals.map(({ address }) => ({ address, status: "working" }));
-  assert.deepEqual(issueSessions("/one/.beads", null, terminals, agents).get("same-id").map(({ address }) => address), ["t1"]);
+test("attention requires an actual Herdr agent at a live terminal in the exact database and machine", () => {
+  const terminal = (address, project, extra = {}) => ({ address, state: "live", labels: { "beads.project": project, "beads.issue": "same-id" }, ...extra });
+  const terminals = [
+    terminal("t1", "/one/.beads"),
+    terminal("t2", "/two/.beads"),
+    terminal("remote/t3", "/one/.beads"),
+    terminal("shell", "/one/.beads", { foreground: { name: "zsh" } }),
+    terminal("ended", "/one/.beads", { state: "finished" }),
+    terminal("unobserved", "/one/.beads", { foreground: { name: "omp" }, title: "omp transcript" }),
+  ];
+  const agents = terminals.filter(({ address }) => address !== "unobserved").map(({ address }) => ({ address, status: "working" }));
+  assert.deepEqual(issueSessions("/one/.beads", null, terminals, agents).get("same-id").map(({ address }) => address), ["shell", "t1"]);
   assert.deepEqual(issueSessions("/one/.beads", "remote", terminals, agents).get("same-id").map(({ address }) => address), ["remote/t3"]);
+  assert.equal(issueSessions("/one/.beads", "other", terminals, agents).size, 0);
+  assert.equal(issueSessions("/one/.beads", null, terminals, []).size, 0);
+});
+
+test("attention never inspects foreground or transcript to infer an execution harness", () => {
+  const terminal = {
+    address: "t1", state: "live", labels: { "beads.project": "/p/.beads", "beads.issue": "p-1" },
+    get foreground() { throw new Error("foreground is not an authority"); },
+    get transcript() { throw new Error("transcript is not an authority"); },
+  };
+  assert.deepEqual(issueSessions("/p/.beads", null, [terminal], [{ address: "t1", status: "blocked", title: "Needs owner" }]).get("p-1"), [
+    { address: "t1", status: "blocked", title: "Needs owner", agent: true },
+  ]);
 });
 
 test("multiple live sessions preserve attention precedence and exclude finished terminals", () => {
   const statuses = ["idle", "working", "done", "blocked"];
-  const terminals = statuses.map((status) => ({ address: status, state: "live", foreground: { name: "omp" }, labels: { "beads.project": "/p/.beads", "beads.issue": "p-1" } }));
+  const terminals = statuses.map((status) => ({ address: status, state: "live", labels: { "beads.project": "/p/.beads", "beads.issue": "p-1" } }));
   terminals.push({ ...terminals[0], address: "ended", state: "finished" });
   const sessions = issueSessions("/p/.beads", null, terminals, statuses.map((status) => ({ address: status, status })));
   assert.deepEqual(sessions.get("p-1").map(({ status }) => status), ["blocked", "done", "working", "idle"]);
 });
 
-test("live sessions take precedence over saved sessions and launch restrictions", () => {
-  const saved = { omp_session: { session_id: "actual-id", session_file: "/sessions/actual.jsonl", machine: "local", worktree: "/worktree" } };
-  for (const status of ["open", "in_progress", "blocked", "deferred", "closed"]) {
-    const item = issue("work", 1, null, { issue_type: "task", status, metadata: saved });
-    assert.equal(issueAction(item, { session: { address: "t1" }, blocked: true, context: true }), "focus");
+const controllerResponse = (run = null, actions = [{ method: "start_or_focus", enabled: true, refusal: null }]) => ({ outcome: "ok", run, actions });
+const executionRun = (activity, state = "running") => ({ disposition: "current", execution: { activity, state } });
+
+test("Start requires explicit controller permission and eligible issue context", () => {
+  const work = issue("work", 1, null, { issue_type: "task" });
+  const response = controllerResponse();
+  assert.equal(issueAction(work, { response }), "start");
+  assert.equal(issueAction({ ...work, status: "in_progress" }, { response }), "start");
+  for (const options of [{}, { response: {} }, { response: controllerResponse(null, []) }, { response, available: false }, { response, context: true }, { response, blocked: true }]) {
+    assert.equal(issueAction(work, options), null);
+  }
+  for (const status of ["blocked", "deferred", "closed"]) assert.equal(issueAction({ ...work, status }, { response }), null);
+  assert.equal(issueAction({ ...work, context: true }, { response }), null);
+  assert.equal(issueAction({ ...work, issue_type: "epic" }, { response }), null);
+});
+
+test("real capability refusals never turn into fallback Start or Resume", () => {
+  const work = issue("work", 1, null, { issue_type: "task", status: "in_progress", metadata: { omp_session: { session_id: "legacy" } } });
+  const actions = [{ method: "start_or_focus", enabled: false, refusal: "unsupported_capability" }, { method: "resume", enabled: false, refusal: "unsupported_capability" }];
+  for (const run of [null, executionRun("active"), executionRun("inactive")]) {
+    assert.equal(issueAction(work, { response: { ...controllerResponse(run, actions), support: { execution: { unsupported: ["exact_resume", "durable_identity"] } } } }), null);
+    assert.equal(issueAction(work, { response: { outcome: "refused", run, error: { code: "unsupported_capability", capability: "exact_resume" } } }), null);
   }
 });
 
-test("only unblocked noncontext in-progress issues with a saved key offer Resume", () => {
-  const saved = { omp_session: { session_id: "actual-id", session_file: "/sessions/actual.jsonl", machine: "local", worktree: "/worktree" } };
-  const working = issue("work", 1, null, { issue_type: "task", status: "in_progress", metadata: saved });
-  assert.equal(issueAction(working), "resume");
-  assert.equal(issueAction(working, { blocked: true }), null);
-  assert.equal(issueAction(working, { context: true }), null);
-  assert.equal(issueAction({ ...working, context: true }), null);
-  for (const status of ["blocked", "deferred", "closed"]) {
-    assert.equal(issueAction({ ...working, status }), null);
+test("Focus and Resume use controller activity and permission, not issue metadata or attention", () => {
+  const work = {
+    ...issue("work", 1, null, { issue_type: "task", status: "in_progress" }),
+    get metadata() { throw new Error("legacy metadata is not an authority"); },
+  };
+  const actions = [{ method: "start_or_focus", enabled: true }, { method: "resume", enabled: true }];
+  assert.equal(issueAction(work, { response: controllerResponse(executionRun("active"), actions) }), "focus");
+  for (const state of ["running", "idle", "stopped", "failed"]) {
+    assert.equal(issueAction(work, { response: controllerResponse(executionRun("inactive", state), actions) }), "resume");
   }
-  assert.equal(issueAction({ ...working, status: "open" }), "start");
-  for (const metadata of [undefined, null, {}, { unrelated: "preserved" }]) {
-    assert.equal(issueAction({ ...working, metadata }), "start");
+  for (const state of ["preparing", "starting", "released"]) {
+    assert.equal(issueAction(work, { response: controllerResponse(executionRun("inactive", state), actions) }), null);
   }
+  assert.equal(issueAction(work, { response: controllerResponse(executionRun("unknown"), actions) }), null);
+  assert.equal(issueAction(work, { response: controllerResponse({ ...executionRun("active"), disposition: "superseded" }, actions) }), null);
+  assert.equal(issueAction(work, { response: controllerResponse(executionRun("active"), []), session: { address: "legacy" } }), null);
 });
 
-test("malformed saved records still offer Resume so the launcher can report their errors", () => {
-  for (const omp_session of [null, false, 0, "", "old-id", [], {}, { session_id: "incomplete" }]) {
-    const working = issue("work", 1, null, { issue_type: "task", status: "in_progress", metadata: { unrelated: "preserved", omp_session } });
-    assert.equal(issueAction(working), "resume");
-  }
-});
-
-test("finished and recovered terminals fall back to the persistent session rather than focus", () => {
-  const working = issue("work", 1, null, { issue_type: "task", status: "in_progress", metadata: { omp_session: { session_id: "saved" } } });
-  const terminal = { address: "t1", state: "live", foreground: { name: "omp" }, labels: { "beads.project": "/p/.beads", "beads.issue": working.id } };
-  for (const change of [{ state: "finished" }, { foreground: { name: "zsh" } }]) {
-    const sessions = issueSessions("/p/.beads", null, [{ ...terminal, ...change }], [{ address: "t1", status: "working" }]);
-    assert.equal(issueAction(working, { session: sessions.get(working.id)?.[0] }), "resume");
-  }
-  const sessions = issueSessions("/p/.beads", null, [terminal], [{ address: "t1", status: "working" }]);
-  assert.equal(issueAction(working, { session: sessions.get(working.id)?.[0] }), "focus");
-});
-
-test("epics never offer Start or Resume, including saved and malformed sessions", () => {
-  for (const status of ["open", "in_progress", "blocked", "deferred", "closed"]) {
-    for (const metadata of [undefined, {}, { omp_session: null }, { omp_session: "old-id" }, { omp_session: { session_id: "saved" } }]) {
-      const epic = issue("epic", 0, null, { status, metadata });
-      for (const options of [{}, { blocked: true }, { context: true }]) {
-        assert.equal(issueAction(epic, options), null);
-      }
-      assert.equal(issueAction(epic, { session: { address: "legacy-live" }, blocked: true, context: true }), "focus");
-    }
-  }
-});
-
-test("finished or recovered legacy epic terminals never become a creation action", () => {
-  const epic = issue("epic", 0, null, { status: "in_progress", metadata: { omp_session: { session_id: "saved" } } });
-  const terminal = { address: "t1", state: "live", foreground: { name: "omp" }, labels: { "beads.project": "/p/.beads", "beads.issue": epic.id } };
-  for (const change of [{ state: "finished" }, { foreground: { name: "zsh" } }]) {
-    const sessions = issueSessions("/p/.beads", null, [{ ...terminal, ...change }], [{ address: "t1", status: "working" }]);
-    assert.equal(issueAction(epic, { session: sessions.get(epic.id)?.[0] }), null);
+test("attention and legacy session metadata cannot create lifecycle actions", () => {
+  for (const omp_session of [null, false, "old", {}, { session_id: "old" }]) {
+    const work = issue("work", 1, null, { issue_type: "task", status: "in_progress", metadata: { omp_session } });
+    assert.equal(issueAction(work, { session: { address: "live", status: "working" } }), null);
+    assert.equal(issueAction(work, { response: controllerResponse() }), "start");
   }
 });
 

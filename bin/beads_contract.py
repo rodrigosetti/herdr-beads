@@ -1,7 +1,9 @@
 """Versioned lifecycle protocol; adapter-private data never enters these schemas."""
+import hashlib
 import json
 from datetime import datetime, timezone
 from functools import lru_cache
+import shlex
 from pathlib import Path
 
 from jsonschema import Draft202012Validator, FormatChecker
@@ -23,6 +25,26 @@ def now():
 
 def canonical_json(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)
+
+
+MANUAL_WARNING = ('Normal manual Beads closure is not atomically revision/run guarded. '
+                  'Reopen, reassignment or a newer submission/run can race this command.')
+MANUAL_REVIEW = ('Review current canonical database/full issue ID, status, ownership, run, '
+                 'submissions and authoritative target evidence immediately before separately '
+                 'executing the command. The integration never executes or retries it. '
+                 'Workspace/session resources remain retained; manual cleanup is a separate external action.')
+
+
+def handoff_digest(handoff):
+    identity = {k: v for k, v in handoff.items() if k not in ('handoffId', 'createdAt')}
+    return hashlib.sha256(canonical_json(identity).encode('utf-8')).hexdigest()
+
+
+def manual_close_command(handoff):
+    scope = handoff['scope']
+    return 'BEADS_DIR=' + shlex.quote(scope['beadsDir']) + ' ' + shlex.join([
+        'bd', '--sandbox', '-C', scope['repository']['root'],
+        'close', '--reason', handoff['evidenceReason'], '--', scope['issueId']])
 
 
 @lru_cache(maxsize=32)
@@ -89,9 +111,26 @@ def validate_run(run):
         invalid('Integrated coverage requires current-fence proof for every required submission.')
     if run['closure']['state'] == 'awaiting_manual':
         ids = [submissions[k]['evidence']['evidenceId'] for k in required if submissions[k]['evidence']]
-        if run['coverage']['state'] != 'integrated' or run['closure']['evidenceIds'] != ids or not run['closure']['manualCommand']:
-            invalid('Manual handoff requires complete current evidence.')
+        observation = run['issueObservation']
+        if (not required or run['coverage']['state'] != 'integrated'
+                or run['closure']['evidenceIds'] != ids or not run['closure']['manualCommand']
+                or not observation or observation['status'] != 'in_progress' or observation['assignee'] != run['owner']):
+            invalid('Manual handoff requires complete current evidence and observed in-progress ownership.')
     elif run['closure']['manualCommand'] is not None:
         invalid('A closure command is only valid for the verified manual handoff.')
+    handoff = run['closure'].get('handoff')
+    if handoff:
+        if (run['closure']['state'] != 'awaiting_manual'
+                or handoff['scope'] != run['scope'] or handoff['fence'] != run['fence']
+                or handoff['owner'] != run['owner'] or handoff['target'] != run['target']
+                or handoff['coverageRevision'] != run['coverage']['revision']
+                or handoff['workspaceHead'] != run['coverage']['workspaceHead']
+                or [s['identity'] for s in handoff['submissions']] != [submissions[k]['identity'] for k in required]
+                or any(s['state'] != 'integrated' or s['evidence'] != submissions[k]['evidence']
+                       for s, k in zip(handoff['submissions'], required))
+                or handoff['warning'] != MANUAL_WARNING or handoff['review'] != MANUAL_REVIEW
+                or handoff['handoffId'] != handoff_digest(handoff)
+                or run['closure']['manualCommand'] != manual_close_command(handoff)):
+            invalid('Manual handoff differs from the current exact scope/owner/fence/coverage/evidence.')
     if 'manual_cleanup_required' not in run['cleanup']['blockers']:
         invalid('Retained resources require a visible manual-cleanup reason.')
