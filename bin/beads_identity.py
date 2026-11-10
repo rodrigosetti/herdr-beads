@@ -34,6 +34,8 @@ def command(argv, cwd, *, env=None, timeout=3):
     for key in tuple(clean):
         if key.startswith('GIT_'):
             clean.pop(key)
+    # Evidence reads must not rewrite history or implicitly fetch promisor objects.
+    clean.update(GIT_NO_REPLACE_OBJECTS='1', GIT_GRAFT_FILE=os.devnull, GIT_NO_LAZY_FETCH='1')
     argv = [executable(argv[0]), *argv[1:]]
     try:
         result = subprocess.run(argv, cwd=cwd, env=clean, text=True,

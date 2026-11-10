@@ -744,8 +744,6 @@ class Controller:
                 raise Refusal('workspace_missing', 'No recorded submission workspace exists.')
             validate_workspace(run['workspace'], run['scope'])
             path = run['workspace']['path']
-            result['head'] = command(['git', 'rev-parse', 'HEAD'], path)
-            result['clean'] = not command(['git', 'status', '--porcelain', '--untracked-files=all'], path)
             if not self.integration:
                 result['error'] = {'code': 'evidence_unavailable', 'message': 'No authoritative integration observer installed; prior proof is audit-only.'}
             else:
@@ -753,6 +751,12 @@ class Controller:
                     result['submissions'] = self.integration.observe(copy.deepcopy(run), copy.deepcopy(private.get('integrationReceipts', [])))
                 except Refusal as error:
                     result['error'] = {'code': error.code, 'message': error.message}
+            # Provider IO may be slow: sample coverage after it, not only before it.
+            validate_workspace(run['workspace'], run['scope'])
+            result['head'] = command(['git', 'rev-parse', 'HEAD'], path)
+            result['clean'] = not command(['git', 'status', '--porcelain', '--untracked-files=all'], path)
+            issue = self.authority.issue(run['scope'])
+            result['issue'] = {'status': issue['status'], 'assignee': issue.get('assignee') or None, 'observedAt': now()}
         return result
 
     def apply_reconcile(self, run, receipt, doc):
@@ -771,7 +775,9 @@ class Controller:
         doc['audit'].append({'kind': 'reconcile', 'fence': copy.deepcopy(run['fence']),
                              'submissions': copy.deepcopy(run['submissions']), 'closure': copy.deepcopy(run['closure']), 'at': now()})
         by_key = {canonical_json(key(s['identity'])): s for s in run['submissions']}
-        observed = receipt.get('submissions', [])
+        # An issue change revokes the observation's fence; discard its proof,
+        # rather than rolling back revocation while validating old-fence evidence.
+        observed = [] if changed else receipt.get('submissions', [])
         if len({canonical_json(key(s['identity'])) for s in observed}) != len(observed):
             raise Refusal('evidence_invalid', 'Observer returned duplicate submission observations.')
         for submission in observed:
