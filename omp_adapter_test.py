@@ -9,6 +9,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).parent / 'bin'))
 from beads_contract import Refusal
+from beads_herdr import HerdrHosting
 from beads_omp import OmpExecution, durable_json, live_omp
 
 
@@ -29,7 +30,7 @@ class Hosting:
     def preflight(self):
         pass
 
-    def start(self, run, argv):
+    def start(self, run, argv, *, issue):
         self.starts.append(argv)
         if self.uncertain:
             raise Refusal('evidence_unavailable', 'reply lost', True)
@@ -54,6 +55,53 @@ class Hosting:
         return {'machineId': 'machine', 'address': info['address'], 'spaceId': None, 'tabId': None}
 
 
+class MemoryHerdr(HerdrHosting):
+    """Stateful local app boundary; mutations change the next listing."""
+    def __init__(self, spaces=None, terminals=None):
+        self.rows = copy.deepcopy(spaces or [])
+        self.terminals = copy.deepcopy(terminals or {})
+        self.events = []
+        self.rename_error = None
+
+    def call(self, argv):
+        if argv == ['herdr-app', 'ls']:
+            return {'spaces': copy.deepcopy(self.rows)}
+        if argv[:2] == ['hc', 'ls']:
+            return {'terminals': [copy.deepcopy(info) for info in self.terminals.values()]}
+        if argv[:2] == ['hc', 'get']:
+            return copy.deepcopy(self.terminals[argv[2]])
+        if argv[:2] == ['hc', 'label']:
+            labels = self.terminals[argv[2]].setdefault('labels', {})
+            labels.update(arg.split('=', 1) for arg in argv[3:] if arg != '--json')
+            return {}
+        raise AssertionError(f'Unexpected hosting command: {argv}')
+
+    def app(self, command_name, **args):
+        self.events.append((command_name, copy.deepcopy(args)))
+        if command_name == 'space.rename':
+            if self.rename_error:
+                raise self.rename_error
+            space = next(row for row in self.rows if row['id'] == args['id'])
+            space['name'] = args['name']
+            return {}
+        if command_name == 'agent.focus':
+            assert args['terminal'] in self.terminals
+            return {}
+        if command_name == 'space.new':
+            space = {'id': 'new-space', 'folder': args['folder'], 'name': args['name'], 'tabs': []}
+            self.rows.append(space)
+        elif command_name == 'tab.new':
+            space = next(row for row in self.rows if row['id'] == args['space'])
+        else:
+            raise AssertionError(f'Unexpected app mutation: {command_name}')
+        address = f't{len(self.terminals) + 1}'
+        tab = {'id': 'new-tab', 'terminals': [{'terminal': address}]}
+        space.setdefault('tabs', []).append(tab)
+        self.terminals[address] = {'address': address, 'cwd': args['folder'],
+                                   'argv': args['argv'], 'state': 'live', 'labels': {}}
+        return {'terminal': address, 'space': space['id'], 'tab': tab['id']}
+
+
 class OmpTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -65,7 +113,8 @@ class OmpTests(unittest.TestCase):
         self.record = {'session_id': 'exact-session', 'session_file': str(self.transcript),
                        'machine': 'machine', 'worktree': str(self.worktree)}
         self.transcript.write_text(json.dumps({'type': 'session', 'id': 'exact-session', 'cwd': str(self.worktree)}) + '\n')
-        self.authority = Authority({'id': 'task-1', 'status': 'in_progress', 'metadata': {'other': {'keep': True}}})
+        self.authority = Authority({'id': 'task-1', 'title': 'Original title', 'status': 'in_progress',
+                                    'metadata': {'other': {'keep': True}}})
         self.hosting = Hosting()
         self.adapter = OmpExecution(self.authority, self.hosting, self.root / 'state')
         self.adapter.binary = lambda name: name
@@ -179,6 +228,64 @@ class OmpTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 'session_owned')
         self.assertEqual(self.transcript.read_bytes(), before)
         self.assertFalse(self.adapter.path(self.run).exists())
+
+    def test_launch_uses_current_title_without_changing_workspace_or_fence(self):
+        self.authority.row['title'] = 'Current: title révisé'
+        self.run['issueObservation'] = {'title': 'Stale title'}
+        original = copy.deepcopy(self.run)
+        self.adapter.hosting = hosting = MemoryHerdr()
+        self.assertIsNone(self.adapter.perform('launch', self.run, self.intent, self.private))
+        self.assertEqual(hosting.rows[0]['name'], 'Current: title révisé')
+        self.assertEqual(self.run, original)
+        self.assertEqual(hosting.terminals['t1']['cwd'], str(self.worktree))
+
+    def test_reuse_renames_only_exact_local_folder_before_creating_tab(self):
+        other = self.root / 'other'
+        other.mkdir()
+        alias = self.root / 'alias'
+        alias.symlink_to(self.worktree, target_is_directory=True)
+        hosting = MemoryHerdr([
+            {'id': 'remote', 'machine': 'foreign', 'folder': str(self.worktree), 'name': 'Old remote'},
+            {'id': 'other', 'folder': str(other), 'name': 'task-1: Original title'},
+            {'id': 'retained', 'folder': str(alias), 'name': 'task-1', 'tabs': [
+                {'id': 'original-tab', 'terminals': [{'terminal': 'original-terminal'}]}]},
+        ])
+        before = copy.deepcopy(self.run)
+        result = hosting.start(self.run, ['omp'], issue=self.authority.issue(self.run['scope']))
+        self.assertEqual([event[0] for event in hosting.events], ['space.rename', 'tab.new'])
+        self.assertEqual(result['space'], 'retained')
+        self.assertEqual(hosting.rows[2]['name'], 'Original title')
+        self.assertEqual(hosting.rows[2]['folder'], str(alias))
+        self.assertEqual(hosting.rows[2]['tabs'][0]['id'], 'original-tab')
+        self.assertEqual(hosting.rows[2]['tabs'][0]['terminals'][0]['terminal'], 'original-terminal')
+        self.assertEqual(hosting.rows[0]['name'], 'Old remote')
+        self.assertEqual(hosting.rows[1]['folder'], str(other))
+        self.assertEqual(self.run, before)
+
+    def test_focus_reconciles_latest_title_without_replacing_exact_session_or_terminal(self):
+        self.previous()
+        config = self.adapter.config(self.run, self.intent, self.private)
+        self.ack(config)
+        info = copy.deepcopy(self.hosting.current)
+        info['labels'] = {'beads.project': self.run['scope']['beadsDir'], 'beads.issue': 'task-1'}
+        hosting = MemoryHerdr([{'id': 'retained', 'folder': str(self.worktree), 'name': 'Old title',
+                               'tabs': [{'id': 'original-tab', 'terminals': [{'terminal': 't1'}]}]}],
+                              {'t1': info})
+        self.adapter.hosting = hosting
+        self.run['execution']['terminal'] = hosting.terminal(self.run, info)
+        self.authority.row['title'] = 'Edited title'
+        original = copy.deepcopy(self.run)
+        record = copy.deepcopy(self.authority.row['metadata'])
+        transcript = self.transcript.read_bytes()
+        self.assertEqual(self.adapter.perform('focus', self.run, self.intent, self.private), {'focused': True})
+        self.assertEqual(hosting.events, [('space.rename', {'id': 'retained', 'name': 'Edited title'}),
+                                          ('agent.focus', {'terminal': 't1'})])
+        self.assertEqual(self.run, original)
+        self.assertEqual(self.authority.row['metadata'], record)
+        self.assertEqual(self.transcript.read_bytes(), transcript)
+        self.assertEqual(hosting.rows[0]['tabs'][0]['id'], 'original-tab')
+        self.adapter.perform('focus', self.run, self.intent, self.private)
+        self.assertEqual([event[0] for event in hosting.events].count('space.rename'), 1)
 
 
 if __name__ == '__main__':

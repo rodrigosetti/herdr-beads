@@ -44,6 +44,7 @@ export default class BeadsDashboard extends View {
     this.operationError = "";
     this.reconciliationError = "";
     this.notice = "";
+    this.namingError = "";
     this.loading = false;
     this.loaded = false;
     this.starting = new Set();
@@ -223,6 +224,14 @@ export default class BeadsDashboard extends View {
         for (const issue of issues) if (issue.status === "blocked") this.blocked.add(issue.id);
         this.ready = new Set(ready.map((issue) => issue.id));
         this.loaded = true;
+        if (!this.machine) {
+          try {
+            const naming = checked(await exec("go-bd", ["--reconcile-spaces", "--json"], { cwd: this.project.folder }), "Space labels");
+            this.namingError = naming.errors.map((error) => error.error).join("\n");
+          } catch (error) {
+            this.namingError = String(error.message ?? error);
+          }
+        }
         this.updated = new Date().toLocaleTimeString();
         this.error = "";
       } catch (error) {
@@ -607,6 +616,7 @@ export default class BeadsDashboard extends View {
         .child(div().text_size(11).text_color(t.muted).child(this.loaded ? `${count} ${count === 1 ? "issue" : "issues"} · ${sessions.size} with agent attention` : "Loading project…")))
       .when(!!this.error, (element) => element.child(div().flex_none().px(16).py(10).bg(t.surface).text_color(t.blocked).child(`${this.error}${this.loaded ? " — showing last successful refresh" : ""}`)))
       .when(!!this.reconciliationError, (element) => element.child(div().flex_none().px(16).py(10).bg(t.surface).text_color(t.blocked).child(`Epic reconciliation failed: ${this.reconciliationError}`)))
+      .when(!!this.namingError, (element) => element.child(div().flex_none().px(16).py(10).bg(t.surface).text_color(t.blocked).child(`Space label reconciliation failed: ${this.namingError}`)))
       .when(!this.service.available, (element) => element.child(div().flex_none().px(16).py(10).bg(t.surface).text_color(t.blocked)
         .child(`${this.service.error?.message ?? this.service.error ?? "Lifecycle service unavailable."} — lifecycle snapshot is last-good/read-only; browsing remains available. No local-launch fallback.`)))
       .when(!!this.operationError, (element) => element.child(div().flex_none().px(16).py(10).bg(t.surface).text_color(t.blocked).child(`Lifecycle operation: ${this.operationError}`)))

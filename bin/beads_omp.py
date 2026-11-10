@@ -242,7 +242,7 @@ class OmpExecution:
             if self.inspect(run, private) != 'active':
                 raise Refusal('session_owned', 'Exact prior process is not active; refresh before resume.')
             info = self.hosting.info(run['execution']['terminal']['address'])
-            self.hosting.focus(run, info)
+            self.hosting.focus(run, info, issue=self.authority.issue(run['scope']))
             if self.inspect(run, private) != 'active':
                 raise Refusal('session_owned', 'omp exited while focusing; no replacement launched.')
             return {'focused': True}
@@ -255,7 +255,8 @@ class OmpExecution:
             argv += ['--resume', config['previous']['session_file']]
         # No startup prompt on argv: extension delivers it only after durability.
         self.hosting.start(run, ['env', f'BEADS_DIR={run["scope"]["beadsDir"]}',
-                                 f'GO_BD_SESSION_CONFIG={self.path(run)}', *argv])
+                                 f'GO_BD_SESSION_CONFIG={self.path(run)}', *argv],
+                           issue=self.authority.issue(run['scope']))
         return self.recover(step, run, intent, private)
 
     def recover(self, step, run, intent, private):

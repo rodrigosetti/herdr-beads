@@ -16,8 +16,10 @@ import tempfile
 import signal
 import uuid
 import time
+from types import SimpleNamespace
 
 from beads_epics import EpicReconcileError, observe_epics
+from beads_presentation import issue_space_name, reconcile_space_names, reconcile_project_spaces
 
 
 class LaunchError(Exception):
@@ -197,7 +199,8 @@ def launch_result(project, issue_id, info, spaces, action):
     }
 
 
-def existing_session(project, issue_id, record, spaces):
+def existing_session(project, issue, record, spaces):
+    issue_id = issue["id"]
     value = json_command([
         "hc", "ls", "--json", "--label", f"beads.project={project.beads}",
         "--label", f"beads.issue={issue_id}",
@@ -224,6 +227,9 @@ def existing_session(project, issue_id, record, spaces):
         ):
             raise LaunchError(f"Saved terminal {address} belongs to another Beads session")
         label_terminal(project, issue_id, address)
+        destination = info.get("cwd") or (info.get("foreground") or {}).get("cwd")
+        if destination:
+            reconcile_space_names(issue, destination, spaces, app)
         app("agent.focus", terminal=address)
         info = terminal_info(address)
         if not live_omp(info):
@@ -470,7 +476,7 @@ def launch_herdr(project, issue, omp):
     issue_id = issue["id"]
     record_name = f"issue-{issue_id}"
     spaces = layout()  # Fail before claiming if this machine has no Herdr window.
-    result = existing_session(project, issue_id, project.load(record_name), spaces)
+    result = existing_session(project, issue, project.load(record_name), spaces)
     if result:
         return result
     destination, omp_argv, env, ack, action = prepare_session(project, issue, omp)
@@ -480,12 +486,13 @@ def launch_herdr(project, issue, omp):
                            and space.get("folder")
                            and Path(space["folder"]).resolve() == destination), None)
     if matching_space:
+        reconcile_space_names(issue, destination, spaces, app)
         created = app("tab.new", space=matching_space["id"], name=issue_id,
                       folder=str(destination), argv=argv)
         created.setdefault("space", matching_space["id"])
     else:
         created = app(
-            "space.new", name=issue_id,
+            "space.new", name=issue_space_name(issue),
             folder=str(destination), tab=issue_id, machine="", argv=argv,
         )
     if not all(created.get(key) for key in ("terminal", "space", "tab")):
@@ -540,18 +547,20 @@ def main():
     mode.add_argument("--dashboard", action="store_true", help="open or reuse this project's Beads dashboard")
     mode.add_argument("--reconcile-epics", action="store_true",
                       help="observe direct-child epic progress without changing issue status")
+    mode.add_argument("--reconcile-spaces", action="store_true",
+                      help="refresh local issue space display labels without changing session identity")
     parser.add_argument("--json", action="store_true", help="emit the Herdr result as one JSON object")
     parser.add_argument("issue", nargs="?", help="issue to claim and run directly with omp")
     args = parser.parse_args()
-    if (args.herdr or args.dashboard or args.reconcile_epics) and args.issue:
-        parser.error("use either a direct issue ID, --herdr ID, --dashboard, or --reconcile-epics")
-    if not (args.herdr or args.dashboard or args.reconcile_epics or args.issue):
-        parser.error("an issue ID, --dashboard, or --reconcile-epics is required")
+    if (args.herdr or args.dashboard or args.reconcile_epics or args.reconcile_spaces) and args.issue:
+        parser.error("use either a direct issue ID or one named mode")
+    if not (args.herdr or args.dashboard or args.reconcile_epics or args.reconcile_spaces or args.issue):
+        parser.error("an issue ID or named mode is required")
     if args.json and args.issue:
-        parser.error("--json requires --herdr ID, --dashboard, or --reconcile-epics")
+        parser.error("--json requires a named mode")
     require_binary("git")
     require_binary("bd")
-    if args.herdr or args.dashboard:
+    if args.herdr or args.dashboard or args.reconcile_spaces:
         require_binary("herdr-app")
         require_binary("hc")
     omp = require_binary("omp") if args.herdr or args.issue else None
@@ -559,6 +568,10 @@ def main():
     if args.reconcile_epics:
         with project.lock("epics"):
             result = observe_epics(project)
+    elif args.reconcile_spaces:
+        with project.lock("space-labels"):
+            result = reconcile_project_spaces(project, SimpleNamespace(
+                spaces=layout, call=json_command, app=app), machine_id())
     elif args.dashboard:
         with project.lock("dashboard"):
             result = dashboard(project)
@@ -575,7 +588,7 @@ def main():
             else:
                 record = project.load(f"issue-{issue_id}")
                 if record.get("terminal") and shutil.which("hc") and shutil.which("herdr-app"):
-                    result = existing_session(project, issue_id, record, [])
+                    result = existing_session(project, issue, record, layout())
                     if result:
                         print(f"Focused {issue_id} in Herdr ({result['space']} / {result['tab']})")
                         return
@@ -592,6 +605,8 @@ def main():
     elif args.reconcile_epics:
         for epic in result["epics"]:
             print(f"{epic['id']}: {epic['closed_children']}/{epic['total_children']} children closed · {epic['status']}")
+    elif args.reconcile_spaces:
+        print(json.dumps(result, ensure_ascii=False))
     else:
         print(f"{result['action'].capitalize()} {result.get('issue', 'Beads dashboard')} "
               f"in Herdr ({result['space']} / {result['tab']})")
