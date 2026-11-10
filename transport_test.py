@@ -83,7 +83,9 @@ class TransportTests(unittest.TestCase):
             connection.settimeout(2)
             connection.connect(str(self.path))
             connection.sendall(data)
-            connection.shutdown(socket.SHUT_WR)
+            if not data.endswith(b"\n"):
+                # EOF is only needed to exercise a missing frame terminator.
+                connection.shutdown(socket.SHUT_WR)
             chunks = bytearray()
             while True:
                 try:
@@ -126,6 +128,42 @@ class TransportTests(unittest.TestCase):
                  "trustedHuman": True, "humanConfirmed": True}
         self.assertEqual(transport.request(value, self.path)["outcome"], "ok")
         self.assertEqual(controller.calls, [(value, False)])
+
+    def test_accepted_response_survives_server_close_before_client_reads(self):
+        class AcceptingController(FakeController):
+            def handle(self, value, *, trusted_human):
+                response = super().handle(value, trusted_human=trusted_human)
+                response.update(outcome="accepted",
+                                operation={"operationId": "operation-1", "state": "pending"})
+                return response
+
+        server, controller, _, errors = self.start_server(AcceptingController())
+        closed = threading.Event()
+        serve_connection = server._connection
+
+        def complete_connection(connection):
+            serve_connection(connection)
+            closed.set()
+
+        caller = threading.current_thread()
+        test = self
+
+        class ScheduledSocket(socket.socket):
+            def sendall(self, data, flags=0):
+                super().sendall(data, flags)
+                if threading.current_thread() is caller:
+                    # Force the peer's real close before the client can read or half-close.
+                    test.assertTrue(closed.wait(2), "Server did not finish the request")
+
+        value = {**status_request("accepted-1"), "method": "reconcile"}
+        with patch.object(server, "_connection", complete_connection):
+            with patch.object(socket, "socket", ScheduledSocket):
+                response = transport.request(value, self.path)
+
+        self.assertEqual(response["outcome"], "accepted", response)
+        self.assertEqual(response["operation"]["operationId"], "operation-1")
+        self.assertEqual(controller.calls, [(value, False)])
+        self.assertEqual(errors, [])
 
     def test_bad_frames_are_json_refusals_without_controller_calls(self):
         _, controller, _, _ = self.start_server()
@@ -264,11 +302,17 @@ class TransportTests(unittest.TestCase):
             self.root.chmod(0o700)
 
     def test_peer_owner_mismatch_is_refused(self):
-        self.start_server()
+        _, controller, _, _ = self.start_server()
         with patch.object(transport, "_peer_uid", return_value=os.getuid() + 1):
-            response = self.exchange(b'{}\n')
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(2)
+                connection.connect(str(self.path))
+                # Peer authorization precedes reading any request bytes.
+                response = transport._read_frame(connection, transport.MAX_RESPONSE_BYTES,
+                                                 time.monotonic() + 2)
         self.assertEqual(response["outcome"], "refused")
         self.assertEqual(response["error"]["code"], "owner_mismatch")
+        self.assertEqual(controller.calls, [])
 
     def test_worker_failure_is_visible_and_stops_service(self):
         class FailingController(FakeController):
