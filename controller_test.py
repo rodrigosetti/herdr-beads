@@ -443,6 +443,36 @@ class LifecycleTests(unittest.TestCase):
         self.assertIsNone(held['closure']['manualCommand'])
         self.assertTrue(any(entry.get('submissions', [{}])[0].get('evidence') == evidence for entry in self.store.read(self.scope)['audit'] if entry.get('submissions')))
 
+    def test_workspace_commit_during_provider_observation_cannot_complete_old_submission(self):
+        self.start()
+        identity = self.handoff()
+        git(self.repo, 'merge', '--ff-only', identity['head'])
+        original = self.controller.integration.observe
+        def observe(run, receipts):
+            result = original(run, receipts)
+            (self.workspace.path / 'new-work').write_text('not submitted')
+            git(self.workspace.path, 'add', '.')
+            git(self.workspace.path, 'commit', '-m', 'unsubmitted during observation')
+            return result
+        self.controller.integration.observe = observe
+        run = self.reconcile()
+        self.assertNotEqual(run['coverage']['state'], 'integrated')
+        self.assertIsNone(run['closure']['manualCommand'])
+
+    def test_issue_reassigned_during_observation_revokes_manual_handoff(self):
+        self.start()
+        identity = self.handoff()
+        git(self.repo, 'merge', '--ff-only', identity['head'])
+        original = self.controller.integration.observe
+        def observe(run, receipts):
+            result = original(run, receipts)
+            self.authority.row['assignee'] = 'new-owner'
+            return result
+        self.controller.integration.observe = observe
+        run = self.reconcile()
+        self.assertEqual(run['disposition'], 'reassigned')
+        self.assertIsNone(run['closure']['manualCommand'])
+
     def test_pr_record_survives_restart_without_local_provider_requirements(self):
         self.start()
         target = {'mode': 'github-pr', 'repository': {'host': 'github.com', 'repositoryId': '123', 'owner': 'owner', 'name': 'repo'}, 'ref': 'refs/heads/master'}
