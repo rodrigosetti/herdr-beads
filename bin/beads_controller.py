@@ -11,11 +11,11 @@ import copy
 import hmac
 from pathlib import Path
 import secrets
-import shlex
 import subprocess
 import uuid
 
-from beads_contract import Refusal, canonical_json, now, validate
+from beads_contract import (Refusal, canonical_json, now, validate, handoff_digest,
+                            manual_close_command, MANUAL_WARNING, MANUAL_REVIEW)
 from beads_identity import Authority, command, validate_workspace
 from beads_integration import IntegrationObserver, ancestor
 from beads_store import Store
@@ -323,7 +323,7 @@ class Controller:
                'session': None, 'terminal': None, 'observedAt': None, 'readOnlyAcknowledged': False},
                'coverage': {'revision': 0, 'workspaceHead': None, 'required': [], 'state': 'unsubmitted'},
                'submissions': [], 'release': {'state': 'held', 'receipt': None},
-               'closure': {'state': 'not_requested', 'evidenceIds': [], 'observedAt': None, 'reason': None, 'manualCommand': None},
+               'closure': {'state': 'not_requested', 'evidenceIds': [], 'observedAt': None, 'reason': None, 'manualCommand': None, 'handoff': None},
                'cleanup': {'state': 'held', 'blockers': ['manual_cleanup_required'], 'checkedAt': None},
                'issueObservation': None, 'createdAt': timestamp, 'updatedAt': timestamp}
         self.preflight(run)
@@ -385,7 +385,7 @@ class Controller:
             raise Refusal('coverage_incomplete', 'Every required source must be present in the declared workspace history.')
         doc['audit'].append({'kind': 'handoff', 'fence': copy.deepcopy(run['fence']),
                              'coverage': copy.deepcopy(run['coverage']), 'submissions': copy.deepcopy(run['submissions']),
-                             'request': copy.deepcopy(request), 'at': now()})
+                             'closure': copy.deepcopy(run['closure']), 'request': copy.deepcopy(request), 'at': now()})
         for identity in identities:
             if identity['target'] != params['target']:
                 raise Refusal('target_changed', 'Every required submission must bind the explicit current mode/target.')
@@ -403,7 +403,7 @@ class Controller:
         run['target'] = copy.deepcopy(params['target'])
         run['coverage'] = {'revision': run['coverage']['revision'] + 1, 'workspaceHead': head,
                            'required': [key(i) for i in identities], 'state': 'pending'}
-        run['closure'].update(state='not_requested', evidenceIds=[], reason=None, manualCommand=None)
+        run['closure'].update(state='not_requested', evidenceIds=[], reason=None, manualCommand=None, handoff=None)
         touch(run)
 
     @staticmethod
@@ -773,6 +773,7 @@ class Controller:
             run['execution']['activity'] = 'unknown'
         required = run['coverage']['required']
         doc['audit'].append({'kind': 'reconcile', 'fence': copy.deepcopy(run['fence']),
+                             'coverage': copy.deepcopy(run['coverage']),
                              'submissions': copy.deepcopy(run['submissions']), 'closure': copy.deepcopy(run['closure']), 'at': now()})
         by_key = {canonical_json(key(s['identity'])): s for s in run['submissions']}
         # An issue change revokes the observation's fence; discard its proof,
@@ -780,7 +781,7 @@ class Controller:
         observed = [] if changed else receipt.get('submissions', [])
         if len({canonical_json(key(s['identity'])) for s in observed}) != len(observed):
             raise Refusal('evidence_invalid', 'Observer returned duplicate submission observations.')
-        for submission in observed:
+        for index, submission in enumerate(observed):
             validate('run', submission, 'Submission')
             identity = submission['identity']
             original = by_key.get(canonical_json(key(identity)))
@@ -792,6 +793,14 @@ class Controller:
                     raise Refusal('evidence_invalid', 'Evidence does not bind this exact fence/submission/SHA/mode/target.')
                 if evidence['kind'] == 'github-pr' and (evidence['pullRequest'] != identity['pullRequest'] or evidence['mergedHead'] != identity['head']):
                     raise Refusal('evidence_invalid', 'PR proof is for a different pull request or merged head.')
+                # Revalidation is fresh, but unchanged proof keeps its durable
+                # identity so polling/restart cannot churn the owner command.
+                old_evidence = original['evidence']
+                if old_evidence:
+                    def proof(value):
+                        return {k: v for k, v in value.items() if k not in ('evidenceId', 'observedAt')}
+                    if proof(old_evidence) == proof(evidence):
+                        observed[index] = copy.deepcopy(original)
         # A failed or partial fresh observation invalidates consumable cached proof.
         for submission in run['submissions']:
             if key(submission['identity']) in required:
@@ -802,22 +811,68 @@ class Controller:
         complete = bool(required) and not changed and run['disposition'] == 'current' and receipt.get('clean') and receipt.get('head') == run['coverage']['workspaceHead'] and all(
             by_key[canonical_json(k)]['state'] == 'integrated' and by_key[canonical_json(k)]['evidence'] for k in required)
         run['coverage']['state'] = 'integrated' if complete else 'unknown' if required else 'unsubmitted'
-        run['closure'].update(state='held' if required else 'not_requested', evidenceIds=[], manualCommand=None,
-                              observedAt=issue['observedAt'], reason=receipt['error']['message'] if receipt.get('error') else 'Integration proof unavailable or invalidated.' if required else None)
+        reason = None
+        if required:
+            if changed or run['disposition'] != 'current':
+                reason = f"Run {run['disposition']}; review current Beads ownership/status and declare a new attempt."
+            elif receipt.get('error'):
+                reason = receipt['error']['message']
+            elif receipt.get('head') != run['coverage']['workspaceHead'] or not receipt.get('clean'):
+                reason = 'Workspace HEAD or cleanliness changed; review and submit the exact current work.'
+            else:
+                states = ', '.join(f"{k['submissionId']}@{k['submissionRevision']}: {by_key[canonical_json(k)]['state']}" for k in required)
+                reason = f'Integration proof unavailable ({states}); review the authoritative target/provider or trusted rewritten-history mapping.'
+        previous_handoff = run['closure'].get('handoff')
+        run['closure'].update(state='held' if required else 'not_requested', evidenceIds=[], manualCommand=None, handoff=None,
+                              observedAt=issue['observedAt'], reason=reason)
         if complete:
             run['execution']['access'] = 'read_only'
-            evidence_ids = [by_key[canonical_json(k)]['evidence']['evidenceId'] for k in required]
-            reason = f"Verified {run['target']['mode']} integration; run {run['fence']['runId']} attempt {run['fence']['attempt']}; evidence {','.join(evidence_ids)}. Owner review required before manual closure."
-            # Copyable normal Beads command. Display only; no execution method exists.
-            close = 'BEADS_DIR=' + shlex.quote(run['scope']['beadsDir']) + ' ' + shlex.join([
-                'bd', '--sandbox', '-C', run['scope']['repository']['root'],
-                'close', '--reason', reason, '--', run['scope']['issueId']])
-            run['closure'].update(state='observed_closed' if issue['status'] == 'closed' else 'awaiting_manual', evidenceIds=evidence_ids,
-                reason='Externally closed — observed only; closure ownership is not established.' if issue['status'] == 'closed' else 'Merged — awaiting manual closure',
-                manualCommand=None if issue['status'] == 'closed' else close)
-        elif issue['status'] == 'closed':
-            run['closure'].update(state='observed_closed', reason='Externally closed — observed only; no run closure ownership or integration inferred.')
+            verified = [by_key[canonical_json(k)] for k in required]
+            evidence_ids = [s['evidence']['evidenceId'] for s in verified]
+            run['closure']['evidenceIds'] = evidence_ids
+            if issue['status'] != 'closed':
+                handoff = self.manual_handoff(run, verified)
+                if previous_handoff and previous_handoff['handoffId'] == handoff['handoffId']:
+                    handoff = previous_handoff
+                run['closure'].update(state='awaiting_manual', reason='Merged — awaiting manual closure',
+                                      handoff=handoff, manualCommand=manual_close_command(handoff))
+        if issue['status'] == 'closed':
+            run['closure'].update(state='observed_closed',
+                reason='Externally closed — observed only; no run closure ownership or integration inferred.')
         run['cleanup'] = {'state': 'held', 'blockers': ['manual_cleanup_required'], 'checkedAt': now()}
+
+    @staticmethod
+    def manual_handoff(run, verified):
+        submissions = copy.deepcopy(verified)
+        details = []
+        for submission in submissions:
+            identity, evidence = submission['identity'], submission['evidence']
+            detail = (f"{identity['submissionId']}@{identity['submissionRevision']} head {identity['head']} "
+                      f"integrated at {evidence['targetCommit']}; evidence {evidence['evidenceId']}")
+            if evidence['kind'] == 'github-pr':
+                detail += (f"; PR {evidence['pullRequest']['url']} merged {evidence['mergedAt']} "
+                           f"head {evidence['mergedHead']} result {evidence['mergeCommit']} "
+                           f"provider record {evidence['providerRecordId']}")
+            elif evidence['kind'] == 'local-target':
+                detail += f"; proof {evidence['proof']}"
+                if evidence['receipt']:
+                    detail += '; trusted rewritten-history receipt ' + canonical_json(evidence['receipt'])
+            else:
+                detail += f"; remote authority {evidence['authorityUrl']} ref {evidence['observedRemoteRef']}"
+            details.append(detail)
+        handoff = {k: copy.deepcopy(run[k]) for k in ('scope', 'fence', 'owner', 'target')}
+        scope, fence = run['scope'], run['fence']
+        reason = (f"Verified {run['target']['mode']} integration for {scope['issueId']}; "
+                  f"database {scope['beadsDir']}; owner {run['owner']}; run {fence['runId']} "
+                  f"attempt {fence['attempt']} generation {fence['generation']}; "
+                  f"coverage {run['coverage']['revision']} workspace HEAD {run['coverage']['workspaceHead']}. "
+                  'Target ' + canonical_json(run['target']) + '. ' + '. '.join(details) +
+                  '. Owner review required before manual closure.')
+        handoff.update(coverageRevision=run['coverage']['revision'], workspaceHead=run['coverage']['workspaceHead'],
+                       submissions=submissions, evidenceReason=reason,
+                       warning=MANUAL_WARNING, review=MANUAL_REVIEW, createdAt=now())
+        handoff['handoffId'] = handoff_digest(handoff)
+        return handoff
 
     @staticmethod
     def invalidate(run, doc, reason):
@@ -827,5 +882,5 @@ class Controller:
             if key(submission['identity']) in run['coverage']['required']:
                 submission.update(state='unknown', evidence=None, observedAt=now())
         run['coverage']['state'] = 'unknown' if run['coverage']['required'] else 'unsubmitted'
-        run['closure'].update(state='held', evidenceIds=[], manualCommand=None, reason=reason)
+        run['closure'].update(state='held', evidenceIds=[], manualCommand=None, handoff=None, reason=reason)
         run['cleanup'] = {'state': 'held', 'blockers': ['manual_cleanup_required'], 'checkedAt': now()}

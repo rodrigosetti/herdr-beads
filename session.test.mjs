@@ -234,6 +234,28 @@ function assertRetained(run) {
 }
 const isolated = { concurrency: false, timeout: 10000 };
 
+test("owner context suppresses stale commands and handoff proof outside awaiting_manual and accepts older records", isolated, async t => {
+  const h = await fixture(t);
+  await h.start();
+  const run = h.controller.run;
+  for (const state of ["held", "observed_closed", "not_requested", "awaiting_manual"]) {
+    run.closure = {
+      state, evidenceIds: [], observedAt: null, reason: state,
+      manualCommand: "STALE-CLOSURE-COMMAND",
+      ...(state === "awaiting_manual" ? {} : { handoff: { handoffId: "STALE-HANDOFF-PROOF" } }),
+    };
+    run.issueObservation = { status: state === "observed_closed" ? "closed" : "in_progress", assignee: "owner", observedAt: run.updatedAt };
+    await h.command("bead-context");
+    const notice = h.notices.at(-1);
+    assert.equal(notice.type, "info", "optional handoff absence supports existing records");
+    assert.ok(notice.message.includes(`Closure state: ${state}`));
+    assert.ok(notice.message.includes(`Observed Beads status: ${run.issueObservation.status}`));
+    assert.ok(!notice.message.includes("STALE-CLOSURE-COMMAND"));
+    assert.ok(!notice.message.includes("STALE-HANDOFF-PROOF"));
+  }
+  assertWritable(h);
+});
+
 test("startup publishes its acknowledgement and task only after durable identity and controller acknowledgement", isolated, async t => {
   const h = await fixture(t);
   const reached = deferred();
